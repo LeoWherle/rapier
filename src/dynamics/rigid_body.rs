@@ -66,6 +66,11 @@ pub struct RigidBody {
     pub(crate) enabled: bool,
     pub(crate) additional_solver_iterations: usize,
     pub(crate) additional_pgs_iterations: usize,
+    /// [distribution patch] User solve-group id (0 = none). Awake connected components whose
+    /// effective ids differ are solved as separate solve groups (own colors/chunks), so one
+    /// group's trajectory does not depend on other groups in the same world.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub(crate) solve_group: u32,
     /// The soft body this rigid body is the root of (invalid for regular rigid bodies).
     #[cfg_attr(
         feature = "serde-serialize",
@@ -115,6 +120,7 @@ impl RigidBody {
             user_data: 0,
             additional_solver_iterations: 0,
             additional_pgs_iterations: 0,
+            solve_group: 0,
             soft_body: crate::dynamics::SoftBodyHandle::invalid(),
             soft_cluster: u32::MAX,
             soft_motion_margin: 0.0,
@@ -164,6 +170,7 @@ impl RigidBody {
             enabled,
             additional_solver_iterations,
             additional_pgs_iterations,
+            solve_group,
             soft_body: _soft_body, // The soft-body markers belong to the proxy, not to its state.
             soft_cluster: _soft_cluster,
             soft_motion_margin: _soft_motion_margin, // Engine-managed, like the markers.
@@ -183,6 +190,7 @@ impl RigidBody {
         self.enabled = *enabled;
         self.additional_solver_iterations = *additional_solver_iterations;
         self.additional_pgs_iterations = *additional_pgs_iterations;
+        self.solve_group = *solve_group;
         self.user_data = *user_data;
 
         self.changes = RigidBodyChanges::all();
@@ -238,6 +246,19 @@ impl RigidBody {
     /// request, soft bodies asking three ([`crate::dynamics::SoftBodyParticleSettings`]).
     pub fn set_additional_pgs_iterations(&mut self, additional_iterations: usize) {
         self.additional_pgs_iterations = additional_iterations;
+    }
+
+    /// [distribution patch] The user solve-group id of this body (0 = none).
+    pub fn solve_group(&self) -> u32 {
+        self.solve_group
+    }
+
+    /// [distribution patch] Sets the user solve-group id (0 = none). Awake connected components
+    /// with different effective ids (max id over the component) are solved as independent solve
+    /// groups, ordered by descending id, so a group's trajectory is invariant to unrelated groups
+    /// in the same world. Components sharing an id share one group. Takes effect at the next step.
+    pub fn set_solve_group(&mut self, id: u32) {
+        self.solve_group = id;
     }
 
     /// The activation status of this rigid-body.
@@ -1691,6 +1712,8 @@ pub struct RigidBodyBuilder {
     ///
     /// See [`RigidBody::set_additional_pgs_iterations`] for additional information.
     pub additional_pgs_iterations: usize,
+    /// [distribution patch] User solve-group id, see [`RigidBody::set_solve_group`].
+    pub solve_group: u32,
     /// Are gyroscopic forces enabled for this rigid-body? (default: `true`)
     pub gyroscopic_forces_enabled: bool,
 }
@@ -1729,6 +1752,7 @@ impl RigidBodyBuilder {
             user_data: 0,
             additional_solver_iterations: 0,
             additional_pgs_iterations: 0,
+            solve_group: 0,
             gyroscopic_forces_enabled: true,
         }
     }
@@ -1801,6 +1825,12 @@ impl RigidBodyBuilder {
     /// involving this rigid-body.
     ///
     /// See [`RigidBody::set_additional_solver_iterations`] for additional information.
+    /// [distribution patch] Sets the user solve-group id, see [`RigidBody::set_solve_group`].
+    pub fn solve_group(mut self, id: u32) -> Self {
+        self.solve_group = id;
+        self
+    }
+
     pub fn additional_solver_iterations(mut self, additional_iterations: usize) -> Self {
         self.additional_solver_iterations = additional_iterations;
         self
@@ -2136,6 +2166,7 @@ impl RigidBodyBuilder {
         rb.body_type = self.body_type;
         rb.user_data = self.user_data;
         rb.additional_solver_iterations = self.additional_solver_iterations;
+        rb.solve_group = self.solve_group;
         rb.additional_pgs_iterations = self.additional_pgs_iterations;
 
         if self.additional_mass_properties
