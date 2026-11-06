@@ -394,6 +394,16 @@ impl RigidBodySet {
     ///     println!("Body {:?} is at {:?}", handle, body.translation());
     /// }
     /// ```
+    /// [fork 0021] Replaces the modified set by every body in ascending arena index (each once),
+    /// so its membership and order no longer depend on which bodies were mutably accessed, and in
+    /// what order, since the last step. See `HistoryFreeHandoff::canonical_modified_set`.
+    pub fn canonicalize_modified_set(&mut self) {
+        self.modified_bodies.clear();
+        for (h, rb) in self.bodies.iter_mut() {
+            self.modified_bodies.push_unchecked(RigidBodyHandle(h), rb);
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (RigidBodyHandle, &RigidBody)> {
         self.bodies.iter().map(|(h, b)| (RigidBodyHandle(h), b))
     }

@@ -450,6 +450,14 @@ pub struct HistoryFreeHandoff {
     /// restored or rebuilt world, whose broad-phase pair set differs, diverges from one that never
     /// restored. Costs a cold GJK start for separated convex-convex pairs.
     pub forget_pointless_normals: bool,
+    /// [fork 0021] At the start of every `PhysicsPipeline::step`, make the rigid-body modified
+    /// set = every body, in ascending arena index. Stock membership and order record which bodies
+    /// were mutably accessed (`&mut bodies[h]`, even without a value change) and in what order;
+    /// both reach the step (active-set epoch bump in `IslandManager::rigid_body_updated`, the
+    /// handling of change flags left on bodies that were not in the set, the order in which
+    /// colliders are pushed to the broad phase), so a snapshot restore — which writes every
+    /// restored body — changed later results. Equivalent to touching every body at tick start.
+    pub canonical_modified_set: bool,
 }
 
 pub(crate) type ContactManifoldIndex = usize;
