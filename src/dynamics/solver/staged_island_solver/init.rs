@@ -21,7 +21,8 @@ use crate::dynamics::FrictionModel;
 use super::sync::StageSync;
 use super::worker::run_worker;
 use super::{
-    CHUNK_BATCH, ChunkSegment, GroupLayout, LAYOUT_REF_WORKERS, SharedCtx, StagedIslandSolver,
+    CHUNK_BATCH, ChunkSegment, GroupLayout, LAYOUT_REF_WORKERS, SERIAL_RUN_COLOR, SharedCtx,
+    StagedIslandSolver,
 };
 
 impl StagedIslandSolver {
@@ -332,13 +333,31 @@ impl StagedIslandSolver {
         if self.groups.len() == 1 {
             // Single group (the common case): the historical zero-copy layout,
             // slicing the persistent buckets directly.
+            // [fork 0006] Colours are laid out in ascending colour order whatever their size:
+            // a large colour is a parallel stage, a maximal run of consecutive small colours is
+            // one worker-0 stage (`SERIAL_RUN_COLOR`) AT ITS RANK. Stock 0.36.1 moved every small
+            // colour to the serial tail after all parallel colours, so the Gauss-Seidel order of
+            // an island depended on world-wide bucket sizes (an unrelated island could push a
+            // shared colour over the threshold). Only the parallel-vs-serial choice depends on
+            // the size now, and it does not change the arithmetic (same-colour constraints are
+            // body-disjoint; chunks are solved by the same kernel either way).
+            let mut in_serial_run = false;
             for (color, refs) in graph.buckets() {
-                if (color as usize) < NUM_COLORS - 1
-                    && refs.len().div_ceil(SIMD_WIDTH) >= min_color_chunks
-                {
-                    let range_start = next_chunk;
-                    push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
+                if (color as usize) >= NUM_COLORS - 1 || refs.is_empty() {
+                    continue;
+                }
+                let parallel = refs.len().div_ceil(SIMD_WIDTH) >= min_color_chunks;
+                let range_start = next_chunk;
+                push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
+                if parallel {
                     self.color_ranges.push((color, range_start..next_chunk));
+                    in_serial_run = false;
+                } else if in_serial_run {
+                    self.color_ranges.last_mut().unwrap().1.end = next_chunk;
+                } else {
+                    self.color_ranges
+                        .push((SERIAL_RUN_COLOR, range_start..next_chunk));
+                    in_serial_run = true;
                 }
             }
 
@@ -367,10 +386,8 @@ impl StagedIslandSolver {
                     overflow_grouped_len = self.overflow_chunk_refs.len();
                     self.overflow_chunk_refs
                         .extend_from_slice(&set.interaction_groups.nongrouped_ref_interactions);
-                } else if refs.len().div_ceil(SIMD_WIDTH) < min_color_chunks {
-                    // A real color too small to parallelize: body-disjoint already.
-                    push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
                 }
+                // [fork 0006] small real colours are laid out above, at their rank.
             }
             // The overflow segments: the grouped prefix is a multiple of SIMD_WIDTH
             // (whole body-disjoint chunks); each ungroupable ref is its own 1-lane
@@ -461,22 +478,28 @@ impl StagedIslandSolver {
             for gi in 0..num_groups {
                 let chunks_start = next_chunk;
                 let colors_start = self.color_ranges.len();
+                // [fork 0006] ascending colour order whatever the size (see the single-group path).
+                let mut in_serial_run = false;
                 for (color, start, len) in &runs[gi] {
                     let refs = &self.grouped_chunk_refs[*start as usize..(*start + *len) as usize];
-                    if refs.len().div_ceil(SIMD_WIDTH) >= min_color_chunks {
-                        let range_start = next_chunk;
-                        push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
+                    if refs.is_empty() {
+                        continue;
+                    }
+                    let parallel = refs.len().div_ceil(SIMD_WIDTH) >= min_color_chunks;
+                    let range_start = next_chunk;
+                    push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
+                    if parallel {
                         self.color_ranges.push((*color, range_start..next_chunk));
+                        in_serial_run = false;
+                    } else if in_serial_run {
+                        self.color_ranges.last_mut().unwrap().1.end = next_chunk;
+                    } else {
+                        self.color_ranges
+                            .push((SERIAL_RUN_COLOR, range_start..next_chunk));
+                        in_serial_run = true;
                     }
                 }
                 let overflow_start = next_chunk;
-                for (color, start, len) in &runs[gi] {
-                    let _ = color;
-                    let refs = &self.grouped_chunk_refs[*start as usize..(*start + *len) as usize];
-                    if refs.len().div_ceil(SIMD_WIDTH) < min_color_chunks {
-                        push_segment(&mut self.chunk_segments, &mut next_chunk, refs);
-                    }
-                }
                 set.interaction_groups.clear_groups();
                 set.interaction_groups.group_manifold_refs(
                     island_bodies.len(),

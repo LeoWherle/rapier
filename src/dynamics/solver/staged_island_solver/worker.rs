@@ -507,14 +507,16 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
              */
             if params.warmstart_coefficient != 0.0 {
                 let multibodies = unsafe { &*ctx.multibodies };
-                for (_, color) in &ctx.color_ranges[group.colors.clone()] {
+                for (color_id, color) in &ctx.color_ranges[group.colors.clone()] {
                     let mut done = 0;
-                    while let Some(claimed) = sync.claim(
-                        stage,
-                        color,
-                        stage_batch(color.end - color.start, sync.num_workers),
-                        worker_id,
-                    ) {
+                    // [fork 0006] a `SERIAL_RUN_COLOR` entry (run of small colours) is solved by worker 0 alone.
+                    let serial_run = *color_id == super::SERIAL_RUN_COLOR;
+                    let mut serial_pending = serial_run && worker_id == 0;
+                    while let Some(claimed) = if serial_run {
+                        if core::mem::take(&mut serial_pending) { Some(color.clone()) } else { None }
+                    } else {
+                        sync.claim(stage, color, stage_batch(color.end - color.start, sync.num_workers), worker_id)
+                    } {
                         let claimed_len = claimed.len();
                         for chunk_id in claimed {
                             let solver_bodies =
@@ -734,14 +736,16 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
          * the speculative `dist * inv_dt` slack would truncate the bounce.
          */
         if has_bouncy {
-            for (_, color) in &ctx.color_ranges[group.colors.clone()] {
+            for (color_id, color) in &ctx.color_ranges[group.colors.clone()] {
                 let mut done = 0;
-                while let Some(claimed) = sync.claim(
-                    stage,
-                    color,
-                    stage_batch(color.end - color.start, sync.num_workers),
-                    worker_id,
-                ) {
+                // [fork 0006] a `SERIAL_RUN_COLOR` entry (run of small colours) is solved by worker 0 alone.
+                let serial_run = *color_id == super::SERIAL_RUN_COLOR;
+                let mut serial_pending = serial_run && worker_id == 0;
+                while let Some(claimed) = if serial_run {
+                    if core::mem::take(&mut serial_pending) { Some(color.clone()) } else { None }
+                } else {
+                    sync.claim(stage, color, stage_batch(color.end - color.start, sync.num_workers), worker_id)
+                } {
                     let claimed_len = claimed.len();
                     for chunk_id in claimed {
                         // SAFETY: constraints of a same color touch pairwise-disjoint bodies.

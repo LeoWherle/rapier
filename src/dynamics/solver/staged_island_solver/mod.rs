@@ -51,6 +51,11 @@ const JOINT_BATCH: usize = 16;
 /// results) across machines with different core counts.
 const LAYOUT_REF_WORKERS: usize = 8;
 
+/// [fork 0006] Marker colour of a `color_ranges` entry holding a run of consecutive small
+/// colours, solved serially by worker 0 in one stage at its rank (not a real colour id: real
+/// colours are `0..=128`).
+const SERIAL_RUN_COLOR: u8 = u8::MAX;
+
 /// Claim-batch size of a constraint stage (~8 claims per worker): tiny batches multiply the
 /// claim/steal cross-core traffic (measurably throttles high worker counts); huge batches leave
 /// stage-tail imbalance. The stealing in [`StageSync::claim`] keeps the tail at one batch.
