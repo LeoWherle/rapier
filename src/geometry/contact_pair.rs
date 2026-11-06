@@ -418,7 +418,7 @@ impl Default for ContactPair {
 }
 
 impl ContactPair {
-    pub(crate) fn new(collider1: ColliderHandle, collider2: ColliderHandle) -> Self {
+    pub fn new(collider1: ColliderHandle, collider2: ColliderHandle) -> Self {
         Self {
             collider1,
             collider2,
@@ -465,7 +465,7 @@ impl ContactPair {
         }
     }
 
-    pub(crate) fn rigid_mut(&mut self) -> Option<&mut RigidPairContacts> {
+    pub fn rigid_mut(&mut self) -> Option<&mut RigidPairContacts> {
         match &mut self.contacts {
             PairContacts::Rigid(rigid) => Some(rigid),
             PairContacts::Soft { .. } => None,

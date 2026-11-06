@@ -147,7 +147,7 @@ impl NarrowPhase {
 
     /// Mutable access to the contact pair involving two specific colliders (the soft-body
     /// solver writes its contact impulses back through it).
-    pub(crate) fn contact_pair_mut(
+    pub fn contact_pair_mut(
         &mut self,
         collider1: ColliderHandle,
         collider2: ColliderHandle,

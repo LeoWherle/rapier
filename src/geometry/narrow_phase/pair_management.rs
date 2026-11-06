@@ -573,6 +573,54 @@ impl NarrowPhase {
         }
     }
 
+    /// [engine-mod-rapier patch] Inserts a contact pair (e.g. exported from another world, with its
+    /// manifolds and warm-start impulses) *before* the broad phase reports it. The broad phase's later
+    /// `AddPair` event finds the edge and keeps it, so the first solve warm-starts from `pair`.
+    /// Returns `false` (and drops `pair`) if a collider is missing, is a sensor, or the edge exists.
+    pub fn insert_contact_pair(&mut self, colliders: &ColliderSet, pair: ContactPair) -> bool {
+        let (Some(co1), Some(co2)) = (colliders.get(pair.collider1), colliders.get(pair.collider2))
+        else {
+            return false;
+        };
+        if co1.is_sensor() || co2.is_sensor() {
+            return false;
+        }
+        let (gid1, gid2) = self.graph_indices.ensure_pair_exists(
+            pair.collider1.0,
+            pair.collider2.0,
+            ColliderGraphIndices::invalid(),
+        );
+        if !InteractionGraph::<(), ()>::is_graph_index_valid(gid1.contact_graph_index) {
+            gid1.contact_graph_index = self.contact_graph.graph.add_node(pair.collider1);
+        }
+        if !InteractionGraph::<(), ()>::is_graph_index_valid(gid2.contact_graph_index) {
+            gid2.contact_graph_index = self.contact_graph.graph.add_node(pair.collider2);
+        }
+        if self
+            .contact_graph
+            .graph
+            .find_edge(gid1.contact_graph_index, gid2.contact_graph_index)
+            .is_some()
+        {
+            return false;
+        }
+        if self.pair_solver_hints.len() == self.contact_graph.graph.edges.len() {
+            self.pair_solver_hints.push(0);
+        } else {
+            self.pair_solver_hints.clear();
+        }
+        if self.force_event_pos.len() == self.contact_graph.graph.edges.len() {
+            self.force_event_pos.push(u32::MAX);
+        } else {
+            self.force_event_pos.clear();
+            self.force_event_pairs.clear();
+            self.force_list_valid = false;
+        }
+        let (i1, i2) = (gid1.contact_graph_index, gid2.contact_graph_index);
+        let _ = self.contact_graph.add_edge(i1, i2, pair);
+        true
+    }
+
     #[profiling::function]
     fn add_pair(&mut self, colliders: &ColliderSet, pair: &ColliderPair) {
         if let (Some(co1), Some(co2)) =
