@@ -224,6 +224,34 @@ pub struct KinematicCharacterController {
     /// [fork 0012] Opt-in cost cuts that change trajectories slightly (all `false` = stock 0.36.1).
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub fast_paths: CharacterFastPaths,
+    /// [fork 0025] Which contacts with kinematic bodies carry the character (default = stock).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub kinematic_carry: KinematicCarry,
+}
+
+/// [fork 0025] Kinematic-friction ("moving platform") policy of the character controller.
+///
+/// Stock (`AllContacts`) transfers motion from *every* kinematic body the character touches: the component of
+/// the remaining translation along each contact normal is replaced by the body's normal velocity, and the
+/// tangential part of the body's velocity is added (larger-absolute-value-wins per axis), whatever the contact
+/// normal. When characters are themselves kinematic bodies that obstruct each other, two characters in side
+/// contact carry each other's *vertical* velocity tangentially: A's upward motion is added to B, B's to A, and
+/// each one's next-tick velocity (displacement / dt) feeds the other again, so the pair is launched (distphys N9:
+/// characters thousands of metres up). Both options below keep every contact on which the character stands
+/// (grounded manifold: normal·up ≥ 1e-3 with a point within the prediction distance) exactly as stock, so
+/// moving platforms behave the same, and change nothing at all for characters that touch no kinematic body.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum KinematicCarry {
+    /// Stock 0.36.1 behaviour.
+    #[default]
+    AllContacts,
+    /// Tangential platform motion only from contacts the character stands on; the normal-velocity
+    /// transfer (a moving kinematic wall pushing the character) is kept for every contact.
+    TangentFromGroundOnly,
+    /// Both the normal and the tangential transfer only from contacts the character stands on: other
+    /// kinematic bodies (e.g. other characters) are plain obstacles from the side.
+    GroundOnly,
 }
 
 /// [fork 0012] Opt-in KCC cost cuts. Each one can change character trajectories (see the fork notes);
@@ -256,6 +284,7 @@ impl Default for KinematicCharacterController {
             snap_to_ground: Some(CharacterLength::Relative(0.2)),
             normal_nudge_factor: 1.0e-4,
             fast_paths: CharacterFastPaths::default(),
+            kinematic_carry: KinematicCarry::AllContacts,
         }
     }
 }
@@ -644,11 +673,18 @@ impl KinematicCharacterController {
                     .filter(|rb| rb.is_kinematic());
 
                 for m in &manifolds {
-                    if self.is_grounded_at_contact_manifold(m, character_pos, dims) {
+                    let ground_manifold = self.is_grounded_at_contact_manifold(m, character_pos, dims);
+                    if ground_manifold {
                         grounded = true;
                     }
+                    // [fork 0025] Which parts of the kinematic transfer this manifold may apply.
+                    let (carry_normal, carry_tangent) = match self.kinematic_carry {
+                        KinematicCarry::AllContacts => (true, true),
+                        KinematicCarry::TangentFromGroundOnly => (true, ground_manifold),
+                        KinematicCarry::GroundOnly => (ground_manifold, ground_manifold),
+                    };
 
-                    if let Some(kinematic_parent) = kinematic_parent {
+                    if let Some(kinematic_parent) = kinematic_parent.filter(|_| carry_normal || carry_tangent) {
                         let mut num_active_contacts = 0;
                         let mut manifold_center = Vector::ZERO;
                         let normal = -(character_pos.rotation * m.local_n1);
@@ -663,12 +699,14 @@ impl KinematicCharacterController {
                                 let normal_current_mvt = translation_remaining.dot(normal);
 
                                 manifold_center += contact_point;
-                                *translation_remaining +=
-                                    normal * (normal_target_mvt - normal_current_mvt);
+                                if carry_normal {
+                                    *translation_remaining +=
+                                        normal * (normal_target_mvt - normal_current_mvt);
+                                }
                             }
                         }
 
-                        if num_active_contacts > 0 {
+                        if num_active_contacts > 0 && carry_tangent {
                             let target_vel = kinematic_parent
                                 .velocity_at_point(manifold_center / num_active_contacts as Real);
                             let tangent_platform_mvt =
