@@ -55,6 +55,8 @@ impl NarrowPhase {
         let recycle_phase =
             recycle_phase | ((self.history_free.recycle_touching_only as u8) << 2);
         self.fork_step_index += 1;
+        // [fork 0020] history-free GJK cache: see HistoryFreeHandoff::forget_pointless_normals.
+        let forget_pointless_normals = self.history_free.forget_pointless_normals;
         let awake_body_mask = core::mem::take(&mut self.awake_body_mask);
         let soft_ctx = soft_bodies.map(|(soft_bodies, params)| SoftDetectionCtx {
             soft_bodies,
@@ -119,6 +121,7 @@ impl NarrowPhase {
                 contact_clustering,
                 contact_recycle_distance,
                 recycle_phase,
+                forget_pointless_normals,
                 bodies,
                 colliders,
                 impulse_joints,
@@ -147,6 +150,7 @@ impl NarrowPhase {
                 contact_clustering,
                 contact_recycle_distance,
                 recycle_phase,
+                forget_pointless_normals,
                 bodies,
                 colliders,
                 impulse_joints,

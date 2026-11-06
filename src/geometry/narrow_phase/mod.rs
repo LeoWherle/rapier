@@ -444,6 +444,12 @@ pub struct HistoryFreeHandoff {
     /// recycling; their `recycle_state` is part of a handoff payload
     /// (`RigidPairContacts::recycle_state`). Requires `IntegrationParameters::contact_recycling`.
     pub recycle_touching_only: bool,
+    /// [fork 0020] Reset the cached normal (`local_n1`/`local_n2`) of every manifold that has no
+    /// contact point, before and after its contact update. Stock parry seeds the convex-convex GJK
+    /// with that normal, so a point-less pair's age changes later contact points (last-ulp) and a
+    /// restored or rebuilt world, whose broad-phase pair set differs, diverges from one that never
+    /// restored. Costs a cold GJK start for separated convex-convex pairs.
+    pub forget_pointless_normals: bool,
 }
 
 pub(crate) type ContactManifoldIndex = usize;

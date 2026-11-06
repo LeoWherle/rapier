@@ -77,6 +77,8 @@ pub(super) fn process_pair(
     contact_recycle_distance: Real,
     // [fork 0007] recycle-epoch phase (see `NarrowPhase::compute_contacts`).
     recycle_phase: u8,
+    // [fork 0020] reset the cached normal of point-less manifolds (HistoryFreeHandoff).
+    forget_pointless_normals: bool,
     bodies: &RigidBodySet,
     colliders: &ColliderSet,
     impulse_joints: &ImpulseJointSet,
@@ -450,6 +452,18 @@ pub(super) fn process_pair(
             rigid.workspace = None;
         }
 
+        // [fork 0020] A manifold without points still caches a normal: parry's convex-convex
+        // (`contact_manifold_pfm_pfm`, e.g. capsule-cuboid) seeds GJK with `local_n1` and stores the
+        // last separating direction there. The seed changes the computed points in the last ulp, so a
+        // pair's contacts depended on how long the pair had existed without touching (fat-AABB
+        // history), not only on the poses. With the switch on, point-less manifolds carry no cache
+        // (in and out), so contact generation is a function of the poses and the touching manifolds.
+        if forget_pointless_normals {
+            for m in rigid.manifolds.iter_mut().filter(|m| m.points.is_empty()) {
+                m.local_n1 = crate::math::Vector::ZERO;
+                m.local_n2 = crate::math::Vector::ZERO;
+            }
+        }
         // Rigid-vs-rigid and soft-vs-rigid collisions.
         let _ = query_dispatcher.contact_manifolds(
             &pos12,
@@ -459,6 +473,12 @@ pub(super) fn process_pair(
             &mut rigid.manifolds,
             &mut rigid.workspace,
         );
+        if forget_pointless_normals {
+            for m in rigid.manifolds.iter_mut().filter(|m| m.points.is_empty()) {
+                m.local_n1 = crate::math::Vector::ZERO;
+                m.local_n2 = crate::math::Vector::ZERO;
+            }
+        }
 
         if let Some(soft) =
             soft.filter(|_| co1.deformable_mesh_ref.is_some() || co2.deformable_mesh_ref.is_some())
