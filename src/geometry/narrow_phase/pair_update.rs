@@ -114,14 +114,20 @@ pub(super) fn process_pair(
     // Contact recycling: if the relative pose barely moved since the
     // last full update, skip contact determination entirely. Must run before the
     // `has_any_active_contact` walk below (whose result recycling cannot change).
+    // [fork 0015] a pair imported with its recycle state tolerates the import's type flip once.
+    let import_keep_recycle =
+        pair.rigid_mut().is_some_and(|r| core::mem::take(&mut r.import_keep_recycle));
     if contact_recycle_distance > 0.0 && recycle_phase & 3 != 1 {
         if let Some(state) = pair.rigid().and_then(|r| r.recycle_state.as_ref()) {
             // Anything beyond a position change (shape, groups, type,
             // enabled flag, ...) requires a full update, as do pairs
             // relying on per-step user hooks.
-            let recycle_safe = ColliderChanges::IN_MODIFIED_SET
+            let mut recycle_safe = ColliderChanges::IN_MODIFIED_SET
                 | ColliderChanges::POSITION
                 | ColliderChanges::LOCAL_MASS_PROPERTIES;
+            if import_keep_recycle {
+                recycle_safe |= ColliderChanges::PARENT_EFFECTIVE_DOMINANCE;
+            }
             let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks).is_empty();
 
             if ((co1.changes | co2.changes) & !recycle_safe).is_empty() && !hooks_involved {

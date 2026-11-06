@@ -627,6 +627,9 @@ impl NarrowPhase {
         mut pair: ContactPair,
     ) -> bool {
         sanitize_imported_pair(&mut pair);
+        if let Some(r) = pair.rigid_mut() {
+            r.import_keep_recycle = r.recycle_state.is_some(); // [fork 0015]
+        }
         let (c1, c2) = (pair.collider1, pair.collider2);
         let existing = match (self.graph_indices.get(c1.0), self.graph_indices.get(c2.0)) {
             (Some(g1), Some(g2)) => self

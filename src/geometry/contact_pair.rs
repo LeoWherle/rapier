@@ -286,6 +286,11 @@ pub struct RigidPairContacts {
     /// reference pose, or its first update recomputes manifolds (and re-derives the
     /// world-frozen solver anchors) where the uninterrupted run would have recycled.
     pub(crate) recycle_state: Option<ContactRecycleState>,
+    /// [fork 0015] Set by `NarrowPhase::import_contact_pair` on a pair imported with a recycle
+    /// state: its next update may recycle although the import flipped a body type (the source
+    /// world computed the pair with the bodies' final types). Cleared by that update.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) import_keep_recycle: bool,
     /// The soft contacts of a soft-rigid pair beside its manifolds (the predictive vertex
     /// contacts and the volume patch, see `SoftRigidContacts`), rebuilt by every update; `None`
     /// for every other pair.
@@ -315,6 +320,7 @@ impl RigidPairContacts {
             solver_color_bodies: [u32::MAX; 2],
             workspace: None,
             recycle_state: None,
+            import_keep_recycle: false,
             soft: None,
         }
     }
