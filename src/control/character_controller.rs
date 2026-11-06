@@ -252,6 +252,11 @@ pub enum KinematicCarry {
     /// Both the normal and the tangential transfer only from contacts the character stands on: other
     /// kinematic bodies (e.g. other characters) are plain obstacles from the side.
     GroundOnly,
+    /// [fork 0026] Contacts the character stands on: as stock. Other contacts with kinematic bodies: no
+    /// tangential carry, and the normal transfer is one-sided: it only raises the character's motion along
+    /// the contact normal (an approaching body pushes it), never lowers it (a receding body does not pull
+    /// it along). This is the shape of Jolt's CharacterVirtual contact-plane constraint.
+    SidesPushOnly,
 }
 
 /// [fork 0012] Opt-in KCC cost cuts. Each one can change character trajectories (see the fork notes);
@@ -682,7 +687,11 @@ impl KinematicCharacterController {
                         KinematicCarry::AllContacts => (true, true),
                         KinematicCarry::TangentFromGroundOnly => (true, ground_manifold),
                         KinematicCarry::GroundOnly => (ground_manifold, ground_manifold),
+                        KinematicCarry::SidesPushOnly => (true, ground_manifold),
                     };
+                    // [fork 0026] one-sided normal transfer on side contacts.
+                    let push_only =
+                        self.kinematic_carry == KinematicCarry::SidesPushOnly && !ground_manifold;
 
                     if let Some(kinematic_parent) = kinematic_parent.filter(|_| carry_normal || carry_tangent) {
                         let mut num_active_contacts = 0;
@@ -699,7 +708,9 @@ impl KinematicCharacterController {
                                 let normal_current_mvt = translation_remaining.dot(normal);
 
                                 manifold_center += contact_point;
-                                if carry_normal {
+                                if carry_normal
+                                    && (!push_only || normal_target_mvt > normal_current_mvt)
+                                {
                                     *translation_remaining +=
                                         normal * (normal_target_mvt - normal_current_mvt);
                                 }
