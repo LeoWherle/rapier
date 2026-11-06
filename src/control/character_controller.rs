@@ -8,6 +8,24 @@ use parry::bounding_volume::BoundingVolume;
 use parry::query::details::ShapeCastOptions;
 use parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher};
 
+/// [fork 0017] Runtime switch (default off = stock): the character controller visits the colliders of its
+/// AABB queries in ascending collider-handle order instead of BVH traversal order. Several loops are order-dependent
+/// (`check_and_fix_penetrations` applies corrections sequentially, the kinematic-friction sum in
+/// `detect_grounded_status_and_apply_friction`, the push in `solve_single_character_collision_impulse`), and the BVH
+/// layout depends on the world's history, so a world restored from a snapshot can otherwise move a character differently.
+pub static KCC_CANONICAL_ORDER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn kcc_aabb_candidates<'a>(
+    queries: &'a QueryPipeline<'a>,
+    aabb: parry::bounding_volume::Aabb,
+) -> Vec<(ColliderHandle, &'a crate::geometry::Collider)> {
+    let mut v: Vec<_> = queries.intersect_aabb_conservative(aabb).collect();
+    if KCC_CANONICAL_ORDER.load(core::sync::atomic::Ordering::Relaxed) {
+        v.sort_by_key(|(h, _)| h.into_raw_parts());
+    }
+    v
+}
+
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, PartialEq)]
 /// A length measure used for various options of a character controller.
@@ -279,7 +297,7 @@ impl KinematicCharacterController {
                 .loosened(offset);
             let mut corrected = false;
 
-            for (_, collider) in queries.intersect_aabb_conservative(character_aabb) {
+            for (_, collider) in kcc_aabb_candidates(queries, character_aabb) {
                 if collider.is_sensor() {
                     continue;
                 }
@@ -595,7 +613,7 @@ impl KinematicCharacterController {
 
         let mut grounded = false;
 
-        'outer: for (_, collider) in queries.intersect_aabb_conservative(character_aabb) {
+        'outer: for (_, collider) in kcc_aabb_candidates(queries, character_aabb) {
             if kinematic_only
                 && !collider
                     .parent
@@ -1022,7 +1040,7 @@ impl KinematicCharacterController {
             .compute_aabb(&collision.character_pos)
             .loosened(prediction);
 
-        for (_, collider) in queries.as_ref().intersect_aabb_conservative(character_aabb) {
+        for (_, collider) in kcc_aabb_candidates(&queries.as_ref(), character_aabb) {
             if let Some(parent) = collider.parent {
                 if let Some(body) = queries.bodies.get(parent.handle) {
                     if body.is_dynamic() {
