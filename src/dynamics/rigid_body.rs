@@ -1016,6 +1016,15 @@ impl RigidBody {
         self.set_angvel(vels.angvel, wake_up);
     }
 
+    /// [fork 0018] Writes the velocities of any body type verbatim (snapshot restore). Unlike
+    /// [`Self::set_linvel`], this also works for kinematic position-based bodies, whose velocity is otherwise only derived
+    /// from the kinematic target during a step; the character controller reads it (kinematic friction / moving platforms),
+    /// so a restored world must carry it. Does not wake the body.
+    pub fn restore_velocities(&mut self, linvel: Vector, angvel: AngVector) {
+        self.vels.linvel = linvel;
+        self.vels.angvel = angvel;
+    }
+
     /// Sets how fast this body is moving (linear velocity).
     ///
     /// This directly sets the body's velocity without applying forces. Use for:
