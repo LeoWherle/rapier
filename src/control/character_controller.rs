@@ -337,6 +337,9 @@ impl KinematicCharacterController {
 
         let mut max_iters = 20;
         let mut kinematic_friction_translation = Vector::ZERO;
+        // [fork 0011] Pose (and grounded-on-kinematic flag) of the last friction pass whose full
+        // grounded status is still owed.
+        let mut pending_ground: Option<(Pose, bool)> = None;
         let offset = self.offset.eval(dims.y);
         let mut is_moving = false;
 
@@ -400,6 +403,7 @@ impl KinematicCharacterController {
                 }
             } else {
                 // No interference along the path.
+                pending_ground = None;
                 result.translation += translation_remaining;
                 result.grounded = self.detect_grounded_status_and_apply_friction(
                     dt,
@@ -412,19 +416,37 @@ impl KinematicCharacterController {
                 );
                 break;
             }
-            result.grounded = self.detect_grounded_status_and_apply_friction(
+            // [fork 0011] Kinematic friction only (manifolds of colliders with a kinematic parent);
+            // the grounded flag of this pose is computed lazily below, only if no later iteration
+            // overwrites it (stock computed every collider's manifolds here on every iteration).
+            let pose = Pose::from_translation(result.translation) * *character_pos;
+            let grounded_on_kinematic = self.detect_grounded_status_and_apply_friction_ext(
                 dt,
                 queries,
                 character_shape,
-                &(Pose::from_translation(result.translation) * *character_pos),
+                &pose,
                 dims,
                 Some(&mut kinematic_friction_translation),
                 Some(&mut translation_remaining),
+                true,
             );
+            pending_ground = Some((pose, grounded_on_kinematic));
 
             if !self.slide {
                 break;
             }
+        }
+        if let Some((pose, grounded_on_kinematic)) = pending_ground {
+            result.grounded = grounded_on_kinematic
+                || self.detect_grounded_status_and_apply_friction(
+                    dt,
+                    queries,
+                    character_shape,
+                    &pose,
+                    dims,
+                    None,
+                    None,
+                );
         }
         // When not moving, `detect_grounded_status_and_apply_friction` is not reached
         // so we call it explicitly here.
@@ -500,8 +522,34 @@ impl KinematicCharacterController {
         character_shape: &dyn Shape,
         character_pos: &Pose,
         dims: Vector2<Real>,
+        kinematic_friction_translation: Option<&mut Vector>,
+        translation_remaining: Option<&mut Vector>,
+    ) -> bool {
+        self.detect_grounded_status_and_apply_friction_ext(
+            dt,
+            queries,
+            character_shape,
+            character_pos,
+            dims,
+            kinematic_friction_translation,
+            translation_remaining,
+            false,
+        )
+    }
+
+    /// [fork 0011] `kinematic_only`: skip colliders without a kinematic parent (they contribute
+    /// no kinematic friction), so the result is only the grounded status on kinematic bodies.
+    #[allow(clippy::too_many_arguments)]
+    fn detect_grounded_status_and_apply_friction_ext(
+        &self,
+        dt: Real,
+        queries: &QueryPipeline,
+        character_shape: &dyn Shape,
+        character_pos: &Pose,
+        dims: Vector2<Real>,
         mut kinematic_friction_translation: Option<&mut Vector>,
         mut translation_remaining: Option<&mut Vector>,
+        kinematic_only: bool,
     ) -> bool {
         let prediction = self.predict_ground(dims.y);
 
@@ -516,6 +564,14 @@ impl KinematicCharacterController {
         let mut grounded = false;
 
         'outer: for (_, collider) in queries.intersect_aabb_conservative(character_aabb) {
+            if kinematic_only
+                && !collider
+                    .parent
+                    .and_then(|p| queries.bodies.get(p.handle))
+                    .is_some_and(|rb| rb.is_kinematic())
+            {
+                continue;
+            }
             manifolds.clear();
             let pos12 = character_pos.inv_mul(collider.position());
             let _ = dispatcher.contact_manifolds(
@@ -807,7 +863,8 @@ impl KinematicCharacterController {
 
         // Check that we are not getting into a ramp that is too steep
         // after stepping.
-        if let Some((_, hit)) = queries.cast_shape(
+        // [fork 0011] The step-height cast below is this exact query: keep its result.
+        let step_down_hit = queries.cast_shape(
             &Pose::from_parts(
                 shifted_character_pos.translation + horizontal_dir * min_width,
                 shifted_character_pos.rotation,
@@ -820,7 +877,8 @@ impl KinematicCharacterController {
                 max_time_of_impact: max_height,
                 compute_impact_geometry_on_penetration: true,
             },
-        ) {
+        );
+        if let Some((_, hit)) = step_down_hit {
             let [vertical_slope_translation, horizontal_slope_translation] = self
                 .split_into_components(*translation_remaining)
                 .map(|remaining| subtract_hit(remaining, &hit));
@@ -840,21 +898,7 @@ impl KinematicCharacterController {
 
         // We can step, we need to find the actual step height.
         let step_height = max_height
-            - queries
-                .cast_shape(
-                    &Pose::from_parts(
-                        shifted_character_pos.translation + horizontal_dir * min_width,
-                        shifted_character_pos.rotation,
-                    ),
-                    -self.up,
-                    character_shape,
-                    ShapeCastOptions {
-                        target_distance: offset,
-                        stop_at_penetration: false,
-                        max_time_of_impact: max_height,
-                        compute_impact_geometry_on_penetration: true,
-                    },
-                )
+            - step_down_hit
                 .map(|hit| hit.1.time_of_impact)
                 .unwrap_or(max_height);
 
