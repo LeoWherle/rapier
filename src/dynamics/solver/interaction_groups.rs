@@ -350,7 +350,17 @@ impl InteractionGroups {
                     self.bucket_len[target_index] = 0;
                 }
             }
-            self.body_masks.iter_mut().for_each(|e| *e = 0);
+            // [fork 0013] Reset only the masks this call set (every set bit belongs to a body of
+            // `to_group`): stock cleared the whole island-sized array, once per solve group in the
+            // multi-group layout (O(G x island bodies) per step).
+            for meta in &self.to_group {
+                if meta.id1 != u32::MAX {
+                    self.body_masks[meta.id1 as usize] = 0;
+                }
+                if meta.id2 != u32::MAX {
+                    self.body_masks[meta.id2 as usize] = 0;
+                }
+            }
         }
 
         assert!(
