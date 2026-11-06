@@ -260,7 +260,11 @@ impl NarrowPhase {
                     let deformed_only = (co.changes
                         & !(ColliderChanges::IN_MODIFIED_SET | ColliderChanges::DEFORMED))
                         .is_empty();
-                    if let Some(islands) = islands.as_deref_mut().filter(|_| !deformed_only) {
+                    // [fork 0016] a quiet handoff import wakes neither the body nor its partners.
+                    let quiet = co.parent.as_ref().is_some_and(|p| {
+                        bodies.get(p.handle).is_some_and(|rb| rb.activation.handoff_quiet)
+                    });
+                    if let Some(islands) = islands.as_deref_mut().filter(|_| !deformed_only && !quiet) {
                         if let Some(co_parent) = &co.parent {
                             islands.wake_up(bodies, co_parent.handle, true);
                         }
@@ -380,6 +384,15 @@ impl NarrowPhase {
                     //       collider. If needed, their collision/intersection data will be
                     //       updated/removed automatically in the contact or intersection update
                     //       functions.
+                }
+            }
+        }
+
+        // [fork 0016] the quiet-import window lasts one user-change pass.
+        for handle in modified_colliders {
+            if let Some(p) = colliders.get(*handle).and_then(|co| co.parent.as_ref()) {
+                if let Some(rb) = bodies.get_mut_internal(p.handle) {
+                    rb.activation.handoff_quiet = false;
                 }
             }
         }

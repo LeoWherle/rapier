@@ -1347,6 +1347,11 @@ pub struct RigidBodyActivation {
     /// Pose at the previous step: the sleep check measures actual per-step displacement,
     /// solver position corrections included (those never show up in the velocities).
     pub(crate) sleep_prev_pose: Pose,
+
+    /// [fork 0016] Handoff import: the next step's user-change pass must not wake this body
+    /// or its contact partners (a strong wake resets their sleep timers). Cleared by that pass.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub handoff_quiet: bool,
 }
 
 impl Default for RigidBodyActivation {
@@ -1385,6 +1390,7 @@ impl RigidBodyActivation {
             time_since_can_sleep: 0.0,
             sleeping: false,
             sleep_prev_pose: Pose::IDENTITY,
+            handoff_quiet: false,
         }
     }
 
@@ -1397,6 +1403,7 @@ impl RigidBodyActivation {
             time_since_can_sleep: Self::default_time_until_sleep(),
             sleeping: true,
             sleep_prev_pose: Pose::IDENTITY,
+            handoff_quiet: false,
         }
     }
 
