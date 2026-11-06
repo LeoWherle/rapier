@@ -29,15 +29,25 @@ pub(crate) struct SolveGroup {
 
 /// The partition key of a body: its extra substeps in the high half, its extra PGS iterations
 /// in the low half, so the groups sort by substep cadence first.
+///
+/// [engine-mod-rapier patch] Widened to u64: the low 32 bits carry a user *solve-group id*
+/// (`RigidBody::solve_group`), so components with different ids
+/// become separate solve groups (own colors/chunks), ordered by id, at equal substep counts.
 #[inline]
-fn key(extra_substeps: u32, extra_pgs: u32) -> u32 {
-    (extra_substeps.min(0xFFFF) << 16) | extra_pgs.min(0xFFFF)
+fn key(extra_substeps: u32, extra_pgs: u32) -> u64 {
+    ((extra_substeps.min(0xFFFF) as u64) << 48) | ((extra_pgs.min(0xFFFF) as u64) << 32)
+}
+/// [distribution patch] The user solve-group id of a body (`RigidBody::solve_group`).
+#[inline]
+pub(crate) fn user_solve_group(rb: &crate::dynamics::RigidBody) -> u32 {
+    rb.solve_group
 }
 
 /// The element-wise maximum of two keys (a component takes the largest of each count).
 #[inline]
-fn max_key(a: u32, b: u32) -> u32 {
-    key((a >> 16).max(b >> 16), (a & 0xFFFF).max(b & 0xFFFF))
+fn max_key(a: u64, b: u64) -> u64 {
+    key(((a >> 48) as u32).max((b >> 48) as u32), (((a >> 32) & 0xFFFF) as u32).max(((b >> 32) & 0xFFFF) as u32))
+        | (a & 0xFFFF_FFFF).max(b & 0xFFFF_FFFF)
 }
 
 /// Workspace state for [`IslandManager::update_substep_groups`], kept to reuse
@@ -47,9 +57,9 @@ fn max_key(a: u32, b: u32) -> u32 {
 pub(crate) struct SubstepGroupsWorkspace {
     uf: UnionFind,
     /// Effective key per awake body slot (component max of each count, see `key`).
-    keys: Vec<u32>,
+    keys: Vec<u64>,
     /// Distinct keys in use, sorted descending.
-    distinct: Vec<u32>,
+    distinct: Vec<u64>,
     /// Scatter cursors/counts per distinct key.
     offsets: Vec<usize>,
     /// Reorder workspace for the awake `bodies` vec.
@@ -158,7 +168,7 @@ impl IslandManager {
             let body_key = key(
                 rb.additional_solver_iterations() as u32,
                 rb.additional_pgs_iterations() as u32,
-            );
+            ) | user_solve_group(rb) as u64;
             if body_key > 0 {
                 let root = ws.uf.find(i as u32) as usize;
                 ws.keys[root] = max_key(ws.keys[root], body_key);
@@ -209,18 +219,18 @@ impl IslandManager {
         // Reorder: stable counting sort by key, descending. Distinct keys are
         // few (one per elevation level in use), so the "find ordinal" scans are
         // effectively O(1).
+        // [distribution patch] sort + dedup + binary search: O(n log G) instead of O(n * G), so
+        // hundreds/thousands of user solve groups stay cheap.
         ws.distinct.clear();
-        for &k in &ws.keys {
-            if !ws.distinct.contains(&k) {
-                ws.distinct.push(k);
-            }
-        }
+        ws.distinct.extend_from_slice(&ws.keys);
         ws.distinct.sort_unstable_by(|a, b| b.cmp(a));
+        ws.distinct.dedup();
+        let ordinal = |d: &[u64], k: u64| d.binary_search_by(|p| k.cmp(p)).unwrap();
 
         ws.offsets.clear();
         ws.offsets.resize(ws.distinct.len(), 0);
         for &k in &ws.keys {
-            let ord = ws.distinct.iter().position(|&d| d == k).unwrap();
+            let ord = ordinal(&ws.distinct, k);
             ws.offsets[ord] += 1;
         }
         let mut start = 0;
@@ -234,7 +244,7 @@ impl IslandManager {
         ws.workspace.clear();
         ws.workspace.resize(num_bodies, RigidBodyHandle::invalid());
         for (i, &handle) in island_bodies.iter().enumerate() {
-            let ord = ws.distinct.iter().position(|&d| d == ws.keys[i]).unwrap();
+            let ord = ordinal(&ws.distinct, ws.keys[i]);
             ws.workspace[ws.offsets[ord]] = handle;
             ws.offsets[ord] += 1;
         }
@@ -267,14 +277,14 @@ fn pair_bodies(
     }
 }
 
-fn push_group_ranges(groups: &mut Vec<SolveGroup>, keys: &[u32]) {
+fn push_group_ranges(groups: &mut Vec<SolveGroup>, keys: &[u64]) {
     let mut start = 0;
     for i in 1..=keys.len() {
         if i == keys.len() || keys[i] != keys[start] {
             groups.push(SolveGroup {
                 body_range: start..i,
-                extra_iters: keys[start] >> 16,
-                extra_pgs: keys[start] & 0xFFFF,
+                extra_iters: (keys[start] >> 48) as u32,
+                extra_pgs: ((keys[start] >> 32) & 0xFFFF) as u32,
             });
             start = i;
         }

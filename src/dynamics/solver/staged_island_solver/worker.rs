@@ -235,7 +235,55 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
         stage = sync.sync(stage, stage_work);
     }
 
-    for (group_index, group) in ctx.groups.iter().enumerate() {
+    // [fork 0008] Group-parallel dispatch. Without solo groups this is the stock ring: every
+    // worker walks every group in order, in lockstep. With them, the team groups first walk the
+    // lockstep ring, then each worker claims whole solo groups and solves each alone through a
+    // private 1-worker `StageSync` (the same stage sequence, so the same bits); one team barrier
+    // closes the ring. See `SharedCtx::solo_groups` for the independence contract.
+    let outer_ctx = ctx;
+    let outer_worker_id = worker_id;
+    let solo_sync = super::sync::StageSync::new(1);
+    let solo_ctx = SharedCtx {
+        sync: &solo_sync,
+        ..*outer_ctx
+    };
+    let any_solo = !outer_ctx.solo_groups.is_empty();
+    let num_team = if any_solo {
+        outer_ctx.team_groups.len()
+    } else {
+        outer_ctx.groups.len()
+    };
+    let num_units = outer_ctx.solo_units.len().saturating_sub(1);
+    let mut ring_pos = 0usize;
+    let mut unit_groups = 0..0;
+    let mut team_stage = stage;
+    let mut solo_stage = 0usize;
+    loop {
+        let (group_index, ctx, worker_id, solo) = if ring_pos < num_team {
+            let g = if any_solo {
+                outer_ctx.team_groups[ring_pos] as usize
+            } else {
+                ring_pos
+            };
+            ring_pos += 1;
+            (g, outer_ctx, outer_worker_id, false)
+        } else if any_solo {
+            if unit_groups.is_empty() {
+                let k = outer_ctx.solo_cursor.fetch_add(1, Ordering::Relaxed);
+                if k >= num_units {
+                    break;
+                }
+                unit_groups = outer_ctx.solo_units[k] as usize..outer_ctx.solo_units[k + 1] as usize;
+            }
+            let g = outer_ctx.solo_groups[unit_groups.start] as usize;
+            unit_groups.start += 1;
+            (g, &solo_ctx, 0, true)
+        } else {
+            break;
+        };
+        let sync = ctx.sync;
+        let mut stage = if solo { solo_stage } else { team_stage };
+        let group = &ctx.groups[group_index];
         // This group's substep parameters: identical to `base_params` except
         // for the substep dt. Everything dt-derived downstream (soft erp/cfm,
         // rhs, speculative terms, integration) recomputes from this copy.
@@ -507,14 +555,16 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
              */
             if params.warmstart_coefficient != 0.0 {
                 let multibodies = unsafe { &*ctx.multibodies };
-                for (_, color) in &ctx.color_ranges[group.colors.clone()] {
+                for (color_id, color) in &ctx.color_ranges[group.colors.clone()] {
                     let mut done = 0;
-                    while let Some(claimed) = sync.claim(
-                        stage,
-                        color,
-                        stage_batch(color.end - color.start, sync.num_workers),
-                        worker_id,
-                    ) {
+                    // [fork 0006] a `SERIAL_RUN_COLOR` entry (run of small colours) is solved by worker 0 alone.
+                    let serial_run = *color_id == super::SERIAL_RUN_COLOR;
+                    let mut serial_pending = serial_run && worker_id == 0;
+                    while let Some(claimed) = if serial_run {
+                        if core::mem::take(&mut serial_pending) { Some(color.clone()) } else { None }
+                    } else {
+                        sync.claim(stage, color, stage_batch(color.end - color.start, sync.num_workers), worker_id)
+                    } {
                         let claimed_len = claimed.len();
                         for chunk_id in claimed {
                             let solver_bodies =
@@ -734,14 +784,16 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
          * the speculative `dist * inv_dt` slack would truncate the bounce.
          */
         if has_bouncy {
-            for (_, color) in &ctx.color_ranges[group.colors.clone()] {
+            for (color_id, color) in &ctx.color_ranges[group.colors.clone()] {
                 let mut done = 0;
-                while let Some(claimed) = sync.claim(
-                    stage,
-                    color,
-                    stage_batch(color.end - color.start, sync.num_workers),
-                    worker_id,
-                ) {
+                // [fork 0006] a `SERIAL_RUN_COLOR` entry (run of small colours) is solved by worker 0 alone.
+                let serial_run = *color_id == super::SERIAL_RUN_COLOR;
+                let mut serial_pending = serial_run && worker_id == 0;
+                while let Some(claimed) = if serial_run {
+                    if core::mem::take(&mut serial_pending) { Some(color.clone()) } else { None }
+                } else {
+                    sync.claim(stage, color, stage_batch(color.end - color.start, sync.num_workers), worker_id)
+                } {
                     let claimed_len = claimed.len();
                     for chunk_id in claimed {
                         // SAFETY: constraints of a same color touch pairwise-disjoint bodies.
@@ -811,6 +863,19 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
             }
             stage = sync.sync(stage, 1);
         }
+        if solo {
+            solo_stage = stage;
+        } else {
+            team_stage = stage;
+        }
+    }
+    let ctx = outer_ctx;
+    let worker_id = outer_worker_id;
+    stage = team_stage;
+    if any_solo {
+        // [fork 0008] Team barrier: every worker completes one unit once the cursor ran dry.
+        sync.complete(stage, 1, sync.num_workers);
+        stage = sync.sync(stage, sync.num_workers);
     }
 
     /*

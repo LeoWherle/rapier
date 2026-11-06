@@ -12,7 +12,7 @@ mod worker;
 
 use crate::alloc_prelude::*;
 use core::ops::Range;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::dynamics::solver::contact_constraint::ContactConstraintsSet;
 use crate::dynamics::solver::interaction_groups::ParallelInteractionGroups;
@@ -38,6 +38,32 @@ use parry::math::SimdReal;
 
 use self::sync::StageSync;
 
+/// [fork 0008] Global switch for the group-parallel dispatch of independent solve groups
+/// (default on). Result-neutral: it is only used when the groups share no solver body, so
+/// turning it off reproduces the same bits through the stock lockstep group ring (A/B timing).
+static GROUP_PARALLEL_DISPATCH: AtomicBool = AtomicBool::new(true);
+
+/// [fork 0008] Enables/disables the group-parallel dispatch of independent substep solve
+/// groups under the `parallel` feature (default: enabled). Results are bit-identical either way.
+pub fn set_group_parallel_dispatch(enabled: bool) {
+    GROUP_PARALLEL_DISPATCH.store(enabled, Ordering::Relaxed);
+}
+
+/// [fork 0008] Whether the group-parallel dispatch is enabled (see [`set_group_parallel_dispatch`]).
+pub fn group_parallel_dispatch() -> bool {
+    GROUP_PARALLEL_DISPATCH.load(Ordering::Relaxed)
+}
+
+/// [fork 0008] Number of solver calls (process-wide, since start) that used the group-parallel
+/// dispatch; for tests and diagnostics.
+pub fn group_parallel_dispatch_count() -> u64 {
+    GROUP_PARALLEL_COUNT.load(Ordering::Relaxed)
+}
+static GROUP_PARALLEL_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(super) fn count_group_parallel_dispatch() {
+    GROUP_PARALLEL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Number of work items claimed at once by a worker.
 const BODY_BATCH: usize = 256;
 const CHUNK_BATCH: usize = 8;
@@ -50,6 +76,11 @@ const JOINT_BATCH: usize = 16;
 /// so a pool-sized threshold would change the Gauss-Seidel order (and therefore the
 /// results) across machines with different core counts.
 const LAYOUT_REF_WORKERS: usize = 8;
+
+/// [fork 0006] Marker colour of a `color_ranges` entry holding a run of consecutive small
+/// colours, solved serially by worker 0 in one stage at its rank (not a real colour id: real
+/// colours are `0..=128`).
+const SERIAL_RUN_COLOR: u8 = u8::MAX;
 
 /// Claim-batch size of a constraint stage (~8 claims per worker): tiny batches multiply the
 /// claim/steal cross-core traffic (measurably throttles high worker counts); huge batches leave
@@ -224,9 +255,28 @@ struct SharedCtx<'a> {
     /// restitution seed (approaching bouncy contact); gates the end-of-step restitution
     /// pass. Published before the first substep barrier, read after it.
     any_bouncy: *const AtomicBool,
+    /// [fork 0008] Groups walked by the whole team in the lockstep ring (in this order) when
+    /// `solo_groups` is non-empty; ignored otherwise (the ring then walks every group in order).
+    team_groups: &'a [u32],
+    /// [fork 0008] Groups solved by single workers, unit by unit: each worker claims the next unit
+    /// from `solo_cursor` and runs the whole stage sequence of each of the unit's groups alone, in
+    /// ring order. Units are independent (no shared solver body). Empty = stock ring.
+    solo_groups: &'a [u32],
+    /// [fork 0008] Unit `k` = `solo_groups[solo_units[k]..solo_units[k + 1]]`.
+    solo_units: &'a [u32],
+    solo_cursor: &'a AtomicUsize,
 }
 
 unsafe impl Sync for SharedCtx<'_> {}
+
+// [fork 0008] `SharedCtx` is a bundle of shared references and raw pointers: a solo-group worker
+// copies it with its own 1-worker `StageSync`.
+impl Clone for SharedCtx<'_> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for SharedCtx<'_> {}
 
 pub(crate) struct StagedIslandSolver {
     pub contact_constraints: ContactConstraintsSet,
@@ -306,6 +356,11 @@ pub(crate) struct StagedIslandSolver {
     /// pipeline falls back to its own pass otherwise.
     pub post_solve_ccd_active: Option<bool>,
     sync: StageSync,
+    /// [fork 0008] See `SharedCtx::team_groups` / `solo_groups`.
+    team_groups: Vec<u32>,
+    solo_groups: Vec<u32>,
+    solo_units: Vec<u32>,
+    solo_cursor: AtomicUsize,
 }
 
 impl StagedIslandSolver {
@@ -343,6 +398,10 @@ impl StagedIslandSolver {
             any_bouncy: AtomicBool::new(false),
             post_solve_ccd_active: None,
             sync: StageSync::new(1),
+            team_groups: Vec::new(),
+            solo_groups: Vec::new(),
+            solo_units: Vec::new(),
+            solo_cursor: AtomicUsize::new(0),
         }
     }
 }

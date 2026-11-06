@@ -13,7 +13,7 @@ pub use self::collider_handle::ColliderHandle;
 #[cfg(feature = "alloc")]
 pub use self::collider_set::{ColliderSet, ModifiedColliders};
 #[cfg(feature = "alloc")]
-pub(crate) use self::contact_pair::ContactRecycleState;
+pub use self::contact_pair::ContactRecycleState;
 #[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::PairEventStatus;
 #[cfg(feature = "alloc")]
@@ -35,6 +35,8 @@ pub use self::interaction_groups::{Group, InteractionGroups, InteractionTestMode
 pub use self::mesh_converter::{MeshConverter, MeshConverterError};
 #[cfg(feature = "alloc")]
 pub use self::narrow_phase::NarrowPhase;
+#[cfg(feature = "alloc")]
+pub use self::narrow_phase::HistoryFreeHandoff;
 #[cfg(feature = "alloc")]
 pub(crate) use self::narrow_phase::soft_contacts;
 #[cfg(feature = "alloc")]

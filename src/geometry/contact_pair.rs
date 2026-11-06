@@ -286,11 +286,30 @@ pub struct RigidPairContacts {
     /// reference pose, or its first update recomputes manifolds (and re-derives the
     /// world-frozen solver anchors) where the uninterrupted run would have recycled.
     pub(crate) recycle_state: Option<ContactRecycleState>,
+    /// [fork 0015] Set by `NarrowPhase::import_contact_pair` on a pair imported with a recycle
+    /// state: its next update may recycle although the import flipped a body type (the source
+    /// world computed the pair with the bodies' final types). Cleared by that update.
+    /// [fork 0019] serialized, so it survives a world snapshot taken between import and step
+    /// (world-per-group: merge, then ship the merged world).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub(crate) import_keep_recycle: bool,
     /// The soft contacts of a soft-rigid pair beside its manifolds (the predictive vertex
     /// contacts and the volume patch, see `SoftRigidContacts`), rebuilt by every update; `None`
     /// for every other pair.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub(crate) soft: Option<Box<SoftRigidContacts>>,
+}
+
+impl RigidPairContacts {
+    /// [fork 0014] The pair's contact-recycle reference state (pose at its last full narrow-phase
+    /// update), if any. Part of an exact handoff payload when contact recycling is on.
+    pub fn recycle_state(&self) -> Option<&ContactRecycleState> {
+        self.recycle_state.as_ref()
+    }
+    /// [fork 0014] Sets the contact-recycle reference state (handoff import).
+    pub fn set_recycle_state(&mut self, state: Option<ContactRecycleState>) {
+        self.recycle_state = state;
+    }
 }
 
 impl RigidPairContacts {
@@ -303,6 +322,7 @@ impl RigidPairContacts {
             solver_color_bodies: [u32::MAX; 2],
             workspace: None,
             recycle_state: None,
+            import_keep_recycle: false,
             soft: None,
         }
     }
@@ -348,7 +368,7 @@ impl RigidPairContacts {
 /// update, used by contact recycling to bound how much the pair moved since.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
-pub(crate) struct ContactRecycleState {
+pub struct ContactRecycleState {
     /// Pose of the second collider relative to the first at the last full update.
     pub pos12: Pose,
     /// World rotation of the first collider at the last full update. The frozen world-space anchors
@@ -418,7 +438,7 @@ impl Default for ContactPair {
 }
 
 impl ContactPair {
-    pub(crate) fn new(collider1: ColliderHandle, collider2: ColliderHandle) -> Self {
+    pub fn new(collider1: ColliderHandle, collider2: ColliderHandle) -> Self {
         Self {
             collider1,
             collider2,
@@ -465,7 +485,7 @@ impl ContactPair {
         }
     }
 
-    pub(crate) fn rigid_mut(&mut self) -> Option<&mut RigidPairContacts> {
+    pub fn rigid_mut(&mut self) -> Option<&mut RigidPairContacts> {
         match &mut self.contacts {
             PairContacts::Rigid(rigid) => Some(rigid),
             PairContacts::Soft { .. } => None,
@@ -815,6 +835,28 @@ pub struct SolverContactGeneric<N: ScalarType, const LANES: usize> {
     pub contact_id: [ContactId; LANES], // 1/1
     #[cfg(feature = "dim3")]
     pub(crate) padding: [N; 1],
+}
+
+impl SolverContact {
+    /// [fork 0014] Builds a solver contact from its public fields (handoff import of a recycled
+    /// pair, whose solver contacts are kept verbatim until its next full narrow-phase update).
+    pub fn from_parts(
+        anchor1: Vector,
+        anchor2: Vector,
+        dist: Real,
+        tangent_velocity: Vector,
+        contact_id: ContactId,
+    ) -> Self {
+        Self {
+            anchor1,
+            anchor2,
+            dist,
+            tangent_velocity,
+            contact_id: [contact_id],
+            #[cfg(feature = "dim3")]
+            padding: [0.0; 1],
+        }
+    }
 }
 
 /// The storage type of [`SolverContactGeneric::contact_id`]: one `Real`-sized slot

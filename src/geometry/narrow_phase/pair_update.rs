@@ -75,6 +75,10 @@ pub(super) fn process_pair(
     contact_clustering: bool,
     // Contact-recycling drift threshold; `0.0` disables recycling.
     contact_recycle_distance: Real,
+    // [fork 0007] recycle-epoch phase (see `NarrowPhase::compute_contacts`).
+    recycle_phase: u8,
+    // [fork 0020] reset the cached normal of point-less manifolds (HistoryFreeHandoff).
+    forget_pointless_normals: bool,
     bodies: &RigidBodySet,
     colliders: &ColliderSet,
     impulse_joints: &ImpulseJointSet,
@@ -112,14 +116,24 @@ pub(super) fn process_pair(
     // Contact recycling: if the relative pose barely moved since the
     // last full update, skip contact determination entirely. Must run before the
     // `has_any_active_contact` walk below (whose result recycling cannot change).
-    if contact_recycle_distance > 0.0 {
+    // [fork 0015] a pair imported with its recycle state tolerates the import's type flip once.
+    let import_keep_recycle =
+        pair.rigid_mut().is_some_and(|r| core::mem::take(&mut r.import_keep_recycle));
+    if contact_recycle_distance > 0.0 && recycle_phase & 3 != 1 {
         if let Some(state) = pair.rigid().and_then(|r| r.recycle_state.as_ref()) {
             // Anything beyond a position change (shape, groups, type,
             // enabled flag, ...) requires a full update, as do pairs
             // relying on per-step user hooks.
-            let recycle_safe = ColliderChanges::IN_MODIFIED_SET
+            let mut recycle_safe = ColliderChanges::IN_MODIFIED_SET
                 | ColliderChanges::POSITION
                 | ColliderChanges::LOCAL_MASS_PROPERTIES;
+            if import_keep_recycle {
+                // [fork 0019] ... and any change flag of a re-inserted collider (world-per-group
+                // merge: `insert_with_parent_at` sets `ColliderChanges::all()`). The pair was computed
+                // in the source world with the same shapes, groups and types; only the pose test
+                // below decides, as in the source world.
+                recycle_safe = ColliderChanges::all();
+            }
             let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks).is_empty();
 
             if ((co1.changes | co2.changes) & !recycle_safe).is_empty() && !hooks_involved {
@@ -148,7 +162,10 @@ pub(super) fn process_pair(
                     // SAFETY: each pair is processed at most once per update (disjoint slots).
                     let mut requalified = false;
                     let hint = unsafe { &mut *hints_ptr.0.add(edge_id as usize) };
-                    if *hint & PAIR_HINT_COUNT_MASK == 0 {
+                    // KQ23 fix: also repair a hint whose DYN bit is stale (pair first processed while
+                    // both sides were asleep, e.g. bodies inserted with `sleeping(true)`, then woken by
+                    // the begin-touch transition without a count-clear).
+                    if *hint & PAIR_HINT_COUNT_MASK == 0 || *hint & PAIR_HINT_DYN_BIT == 0 {
                         let dyn_awake = |co: &crate::geometry::Collider| {
                             co.parent.is_some_and(|p| {
                                 let rb = &bodies[p.handle];
@@ -435,6 +452,18 @@ pub(super) fn process_pair(
             rigid.workspace = None;
         }
 
+        // [fork 0020] A manifold without points still caches a normal: parry's convex-convex
+        // (`contact_manifold_pfm_pfm`, e.g. capsule-cuboid) seeds GJK with `local_n1` and stores the
+        // last separating direction there. The seed changes the computed points in the last ulp, so a
+        // pair's contacts depended on how long the pair had existed without touching (fat-AABB
+        // history), not only on the poses. With the switch on, point-less manifolds carry no cache
+        // (in and out), so contact generation is a function of the poses and the touching manifolds.
+        if forget_pointless_normals {
+            for m in rigid.manifolds.iter_mut().filter(|m| m.points.is_empty()) {
+                m.local_n1 = crate::math::Vector::ZERO;
+                m.local_n2 = crate::math::Vector::ZERO;
+            }
+        }
         // Rigid-vs-rigid and soft-vs-rigid collisions.
         let _ = query_dispatcher.contact_manifolds(
             &pos12,
@@ -444,6 +473,12 @@ pub(super) fn process_pair(
             &mut rigid.manifolds,
             &mut rigid.workspace,
         );
+        if forget_pointless_normals {
+            for m in rigid.manifolds.iter_mut().filter(|m| m.points.is_empty()) {
+                m.local_n1 = crate::math::Vector::ZERO;
+                m.local_n2 = crate::math::Vector::ZERO;
+            }
+        }
 
         if let Some(soft) =
             soft.filter(|_| co1.deformable_mesh_ref.is_some() || co2.deformable_mesh_ref.is_some())
@@ -703,7 +738,15 @@ pub(super) fn process_pair(
 
         // Remember the relative configuration this full update ran at, so
         // subsequent steps can recycle the pair while it stays close to it.
-        if contact_recycle_distance > 0.0 {
+        // [fork 0007] inside a recycle epoch, keep the epoch's reference pose.
+        // [fork 0014] recycle_touching_only: a pair without contact points keeps no reference
+        // pose (it is fully updated every step, like a fresh pair).
+        let pointless = recycle_phase & 4 != 0 && rigid.manifolds.iter().all(|m| m.points.is_empty());
+        if pointless {
+            rigid.recycle_state = None;
+        } else if contact_recycle_distance > 0.0
+            && (recycle_phase & 3 != 2 || rigid.recycle_state.is_none())
+        {
             // Computing the local AABBs goes through a dyn Shape call per
             // collider per full update; the extents only change when a
             // shape does, so reuse the previous full update's value.

@@ -199,6 +199,40 @@ impl ColliderSet {
     ///     &mut bodies
     /// );
     /// ```
+    /// [engine-mod-rapier patch] Like [`Self::insert_with_parent`] but at a caller-chosen slot.
+    pub fn insert_with_parent_at(
+        &mut self,
+        index: u32,
+        coll: impl Into<Collider>,
+        parent_handle: RigidBodyHandle,
+        bodies: &mut RigidBodySet,
+    ) -> Option<ColliderHandle> {
+        let mut coll = coll.into();
+        coll.reset_internal_references();
+        if let Some(prev_parent) = &mut coll.parent {
+            prev_parent.handle = parent_handle;
+        } else {
+            coll.parent = Some(ColliderParent {
+                handle: parent_handle,
+                pos_wrt_parent: coll.pos.0,
+            });
+        }
+        let parent = bodies
+            .get_mut_internal_with_modification_tracking(parent_handle)
+            .expect("Parent rigid body not found.");
+        let handle = ColliderHandle(self.colliders.insert_at(index, coll)?);
+        let coll = self.colliders.get_mut(handle.0).unwrap();
+        self.modified_colliders.push_unchecked(handle, coll);
+        parent.add_collider_internal(
+            handle,
+            coll.parent.as_mut().unwrap(),
+            &mut coll.pos,
+            &coll.shape,
+            &coll.mprops,
+        );
+        Some(handle)
+    }
+
     pub fn insert_with_parent(
         &mut self,
         coll: impl Into<Collider>,

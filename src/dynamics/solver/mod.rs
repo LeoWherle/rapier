@@ -19,6 +19,9 @@ mod solver_body;
 pub(crate) mod solver_contact_graph;
 mod staged_island_solver;
 pub(crate) use staged_island_solver::StagedIslandSolver;
+pub use staged_island_solver::{
+    group_parallel_dispatch, group_parallel_dispatch_count, set_group_parallel_dispatch,
+};
 mod velocity_solver;
 
 // TODO: SAFETY: restrict with bytemuck::Zeroable to make this safe.

@@ -141,7 +141,7 @@ impl BroadPhaseBvh {
     ) -> QueryPipeline<'a> {
         QueryPipeline {
             dispatcher,
-            bvh: &self.tree,
+            bvh: self.canonical_query_tree.as_ref().unwrap_or(&self.tree), // [fork 0022]
             bodies,
             colliders,
             filter,
@@ -158,7 +158,7 @@ impl BroadPhaseBvh {
     ) -> QueryPipelineMut<'a> {
         QueryPipelineMut {
             dispatcher,
-            bvh: &self.tree,
+            bvh: self.canonical_query_tree.as_ref().unwrap_or(&self.tree), // [fork 0022]
             bodies,
             colliders,
             filter,

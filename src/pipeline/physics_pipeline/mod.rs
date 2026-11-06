@@ -220,6 +220,10 @@ impl PhysicsPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
+        // [fork 0021] history-free modified set (opt-in).
+        if narrow_phase.history_free.canonical_modified_set {
+            bodies.canonicalize_modified_set();
+        }
         // With a dedicated pool configured, run the whole step inside it.
         #[cfg(all(feature = "parallel", not(feature = "unsync-callbacks")))]
         if let Some(pool) = self.thread_pool.clone() {

@@ -2,8 +2,10 @@
 
 #[cfg(feature = "alloc")]
 pub use self::character_controller::{
-    CharacterAutostep, CharacterCollision, CharacterLength, EffectiveCharacterMovement,
-    KinematicCharacterController,
+    CharacterPush, CharacterPushManifold, KinematicCarry,
+    KCC_CANONICAL_ORDER,
+    CharacterAutostep, CharacterCollision, CharacterFastPaths, CharacterLength,
+    EffectiveCharacterMovement, KinematicCharacterController,
 };
 #[cfg(feature = "alloc")]
 pub use self::pid_controller::{PdController, PdErrors, PidController};

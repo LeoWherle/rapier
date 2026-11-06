@@ -44,6 +44,19 @@ impl NarrowPhase {
         soft_bodies: Option<(&SoftBodySet, &IntegrationParameters)>,
     ) {
         self.update_awake_body_mask(islands);
+        // [fork 0007] recycle epochs: 0 = stock, 1 = epoch step (full update + re-anchor every
+        // pair), 2 = inside an epoch (recycle as usual, anchor only pairs without a state).
+        let recycle_phase: u8 = match self.history_free.recycle_epoch {
+            0 => 0,
+            n if self.fork_step_index % n as u64 == 0 => 1,
+            _ => 2,
+        };
+        // [fork 0014] bit 2: recycle only pairs that hold contact points.
+        let recycle_phase =
+            recycle_phase | ((self.history_free.recycle_touching_only as u8) << 2);
+        self.fork_step_index += 1;
+        // [fork 0020] history-free GJK cache: see HistoryFreeHandoff::forget_pointless_normals.
+        let forget_pointless_normals = self.history_free.forget_pointless_normals;
         let awake_body_mask = core::mem::take(&mut self.awake_body_mask);
         let soft_ctx = soft_bodies.map(|(soft_bodies, params)| SoftDetectionCtx {
             soft_bodies,
@@ -107,6 +120,8 @@ impl NarrowPhase {
                 dt,
                 contact_clustering,
                 contact_recycle_distance,
+                recycle_phase,
+                forget_pointless_normals,
                 bodies,
                 colliders,
                 impulse_joints,
@@ -134,6 +149,8 @@ impl NarrowPhase {
                 dt,
                 contact_clustering,
                 contact_recycle_distance,
+                recycle_phase,
+                forget_pointless_normals,
                 bodies,
                 colliders,
                 impulse_joints,
@@ -241,27 +258,26 @@ impl NarrowPhase {
             const BLOCK: usize = 64;
             #[allow(unused_mut)]
             let (mut dirty, mut force_full_rebuild) = if update_candidates.len() > BLOCK {
-                let cursor = core::sync::atomic::AtomicUsize::new(0);
-                let candidates = &update_candidates[..];
-                let per_thread = rayon::broadcast(|_| {
-                    let mut stats = (Vec::new(), false);
-                    loop {
-                        let start = cursor.fetch_add(BLOCK, core::sync::atomic::Ordering::Relaxed);
-                        if start >= candidates.len() {
-                            break;
-                        }
-                        let end = (start + BLOCK).min(candidates.len());
-                        process_block(&mut stats, &candidates[start..end], worker_hooks);
-                    }
-                    stats
-                });
-                per_thread
-                    .into_iter()
-                    .fold((Vec::new(), false), |mut a, mut b| {
-                        a.0.append(&mut b.0);
-                        a.1 |= b.1;
-                        a
-                    })
+                // Chunked fold/reduce instead of `rayon::broadcast`: a broadcast job must run on
+                // EVERY pool thread (it cannot be stolen), so one descheduled worker delays it.
+                use rayon::prelude::*;
+                update_candidates
+                    .par_chunks(BLOCK)
+                    .fold(
+                        || (Vec::new(), false),
+                        |mut s, c| {
+                            process_block(&mut s, c, worker_hooks);
+                            s
+                        },
+                    )
+                    .reduce(
+                        || (Vec::new(), false),
+                        |mut a, mut b| {
+                            a.0.append(&mut b.0);
+                            a.1 |= b.1;
+                            a
+                        },
+                    )
             } else {
                 let mut stats = (Vec::new(), false);
                 process_block(&mut stats, &update_candidates, worker_hooks);
@@ -391,6 +407,54 @@ impl NarrowPhase {
             }
         }
         self.apply_deferred_solver_coloring(&mut color_todo);
+        // [fork 0007] canonical colouring: re-derive every touching pair's colour from scratch,
+        // in canonical (min, max body index, edge) order, whenever anything that colouring
+        // depends on changed. The result is a function of the current touching set only.
+        if self.history_free.canonical_coloring && (!transitions.is_empty() || !self.fork_canon_clean)
+        {
+            use crate::geometry::contact_pair::SOLVER_COLOR_UNCOLORED;
+            let old_colors: Vec<u8> = self
+                .contact_graph
+                .graph
+                .edges
+                .iter()
+                .map(|e| e.weight.rigid().map_or(SOLVER_COLOR_UNCOLORED, |r| r.solver_color))
+                .collect();
+            for m in self.body_solver_color_masks.iter_mut() {
+                *m = 0;
+            }
+            color_todo.clear();
+            for edge_id in 0..self.contact_graph.graph.edges.len() {
+                let pair = &mut self.contact_graph.graph.edges[edge_id].weight;
+                if let Some(r) = pair.rigid_mut() {
+                    r.solver_color = SOLVER_COLOR_UNCOLORED;
+                    r.solver_color_bodies = [u32::MAX; 2];
+                }
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let body_info = |co: ColliderHandle| {
+                    colliders.get(co).and_then(|co| co.parent.as_ref()).map(|p| {
+                        let rb = &bodies[p.handle];
+                        (p.handle.into_raw_parts().0, rb.is_fixed())
+                    })
+                };
+                let (i1, i2) = (body_info(pair.collider1), body_info(pair.collider2));
+                color_todo.push((edge_id as u32, pack_color_body_info(i1), pack_color_body_info(i2)));
+            }
+            self.apply_deferred_solver_coloring(&mut color_todo);
+            let changed = self
+                .contact_graph
+                .graph
+                .edges
+                .iter()
+                .zip(old_colors.iter())
+                .any(|(e, &c)| e.weight.rigid().map_or(SOLVER_COLOR_UNCOLORED, |r| r.solver_color) != c);
+            if changed {
+                self.solver_graph_valid = false;
+            }
+        }
+        self.fork_canon_clean = true;
         self.solver_color_todo = color_todo;
     }
 

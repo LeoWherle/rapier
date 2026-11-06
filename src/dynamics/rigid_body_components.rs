@@ -1347,6 +1347,11 @@ pub struct RigidBodyActivation {
     /// Pose at the previous step: the sleep check measures actual per-step displacement,
     /// solver position corrections included (those never show up in the velocities).
     pub(crate) sleep_prev_pose: Pose,
+
+    /// [fork 0016] Handoff import: the next step's user-change pass must not wake this body
+    /// or its contact partners (a strong wake resets their sleep timers). Cleared by that pass.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub handoff_quiet: bool,
 }
 
 impl Default for RigidBodyActivation {
@@ -1385,6 +1390,7 @@ impl RigidBodyActivation {
             time_since_can_sleep: 0.0,
             sleeping: false,
             sleep_prev_pose: Pose::IDENTITY,
+            handoff_quiet: false,
         }
     }
 
@@ -1397,6 +1403,7 @@ impl RigidBodyActivation {
             time_since_can_sleep: Self::default_time_until_sleep(),
             sleeping: true,
             sleep_prev_pose: Pose::IDENTITY,
+            handoff_quiet: false,
         }
     }
 
@@ -1407,6 +1414,19 @@ impl RigidBodyActivation {
             angular_threshold: -1.0,
             ..Self::active()
         }
+    }
+
+    /// [fork 0014] The pose the sleep test compares the next step's pose with (the body's pose
+    /// at its previous dynamic step). Part of an exact handoff payload for sleep-enabled bodies.
+    #[inline]
+    pub fn sleep_prev_pose(&self) -> &Pose {
+        &self.sleep_prev_pose
+    }
+
+    /// [fork 0014] Sets the pose the next sleep test compares with (handoff import).
+    #[inline]
+    pub fn set_sleep_prev_pose(&mut self, pose: Pose) {
+        self.sleep_prev_pose = pose;
     }
 
     /// Returns `true` if the body is not asleep.
@@ -1489,7 +1509,15 @@ impl RigidBodyActivation {
             RigidBodyType::KinematicPositionBased | RigidBodyType::KinematicVelocityBased => {
                 // Platforms only sleep if both velocities are exactly zero. If it’s not exactly
                 // zero, then the user really wants them to move.
-                sq_linvel == 0.0 && sq_angvel == 0.0
+                // [fork 0023] A negative threshold means "never sleeps" for kinematic bodies too
+                // (`RigidBodyBuilder::can_sleep(false)`, `RigidBodyActivation::cannot_sleep()`):
+                // stock ignored the thresholds here, so a standing kinematic body (e.g. a character
+                // controller's body) fell asleep anyway and kept a sleep timer whose value depended
+                // on strong wakes (snapshot restores), not only on its motion.
+                self.normalized_linear_threshold >= 0.0
+                    && self.angular_threshold >= 0.0
+                    && sq_linvel == 0.0
+                    && sq_angvel == 0.0
             }
             RigidBodyType::Fixed => true,
         };

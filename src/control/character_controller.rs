@@ -8,6 +8,24 @@ use parry::bounding_volume::BoundingVolume;
 use parry::query::details::ShapeCastOptions;
 use parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher};
 
+/// [fork 0017] Runtime switch (default off = stock): the character controller visits the colliders of its
+/// AABB queries in ascending collider-handle order instead of BVH traversal order. Several loops are order-dependent
+/// (`check_and_fix_penetrations` applies corrections sequentially, the kinematic-friction sum in
+/// `detect_grounded_status_and_apply_friction`, the push in `solve_single_character_collision_impulse`), and the BVH
+/// layout depends on the world's history, so a world restored from a snapshot can otherwise move a character differently.
+pub static KCC_CANONICAL_ORDER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn kcc_aabb_candidates<'a>(
+    queries: &'a QueryPipeline<'a>,
+    aabb: parry::bounding_volume::Aabb,
+) -> Vec<(ColliderHandle, &'a crate::geometry::Collider)> {
+    let mut v: Vec<_> = queries.intersect_aabb_conservative(aabb).collect();
+    if KCC_CANONICAL_ORDER.load(core::sync::atomic::Ordering::Relaxed) {
+        v.sort_by_key(|(h, _)| h.into_raw_parts());
+    }
+    v
+}
+
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, PartialEq)]
 /// A length measure used for various options of a character controller.
@@ -203,6 +221,60 @@ pub struct KinematicCharacterController {
     /// This value should remain fairly small since it can introduce artificial "bumps" when sliding
     /// along a flat surface.
     pub normal_nudge_factor: Real,
+    /// [fork 0012] Opt-in cost cuts that change trajectories slightly (all `false` = stock 0.36.1).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub fast_paths: CharacterFastPaths,
+    /// [fork 0025] Which contacts with kinematic bodies carry the character (default = stock).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub kinematic_carry: KinematicCarry,
+}
+
+/// [fork 0025] Kinematic-friction ("moving platform") policy of the character controller.
+///
+/// Stock (`AllContacts`) transfers motion from *every* kinematic body the character touches: the component of
+/// the remaining translation along each contact normal is replaced by the body's normal velocity, and the
+/// tangential part of the body's velocity is added (larger-absolute-value-wins per axis), whatever the contact
+/// normal. When characters are themselves kinematic bodies that obstruct each other, two characters in side
+/// contact carry each other's *vertical* velocity tangentially: A's upward motion is added to B, B's to A, and
+/// each one's next-tick velocity (displacement / dt) feeds the other again, so the pair is launched (distphys N9:
+/// characters thousands of metres up). Both options below keep every contact on which the character stands
+/// (grounded manifold: normal·up ≥ 1e-3 with a point within the prediction distance) exactly as stock, so
+/// moving platforms behave the same, and change nothing at all for characters that touch no kinematic body.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum KinematicCarry {
+    /// Stock 0.36.1 behaviour.
+    #[default]
+    AllContacts,
+    /// Tangential platform motion only from contacts the character stands on; the normal-velocity
+    /// transfer (a moving kinematic wall pushing the character) is kept for every contact.
+    TangentFromGroundOnly,
+    /// Both the normal and the tangential transfer only from contacts the character stands on: other
+    /// kinematic bodies (e.g. other characters) are plain obstacles from the side.
+    GroundOnly,
+    /// [fork 0026] Contacts the character stands on: as stock. Other contacts with kinematic bodies: no
+    /// tangential carry, and the normal transfer is one-sided: it only raises the character's motion along
+    /// the contact normal (an approaching body pushes it), never lowers it (a receding body does not pull
+    /// it along). This is the shape of Jolt's CharacterVirtual contact-plane constraint.
+    SidesPushOnly,
+}
+
+/// [fork 0012] Opt-in KCC cost cuts. Each one can change character trajectories (see the fork notes);
+/// all `false` (the default) reproduces stock 0.36.1 exactly.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CharacterFastPaths {
+    /// When the character is grounded at its start pose, drop the downward (−`up`) part of the
+    /// desired translation before the slide loop: no slide-loop cast just to touch the ground
+    /// (snap-to-ground still follows descending ground). A character walking off a ledge starts
+    /// to fall one tick later.
+    pub grounded_skip_downward: bool,
+    /// Snap to the ground only if the character is not already grounded at the end of the slide
+    /// loop (the stock comment's intent; stock snaps whenever it was grounded at the start).
+    pub snap_only_if_not_grounded: bool,
+    /// Skip the autostep casts when the obstacle's highest point (exact support point along `up`)
+    /// is above `feet + max_height`: such a step cannot succeed in the usual geometry.
+    pub autostep_height_precheck: bool,
 }
 
 impl Default for KinematicCharacterController {
@@ -216,6 +288,8 @@ impl Default for KinematicCharacterController {
             min_slope_slide_angle: Real::frac_pi_4(),
             snap_to_ground: Some(CharacterLength::Relative(0.2)),
             normal_nudge_factor: 1.0e-4,
+            fast_paths: CharacterFastPaths::default(),
+            kinematic_carry: KinematicCarry::AllContacts,
         }
     }
 }
@@ -257,7 +331,7 @@ impl KinematicCharacterController {
                 .loosened(offset);
             let mut corrected = false;
 
-            for (_, collider) in queries.intersect_aabb_conservative(character_aabb) {
+            for (_, collider) in kcc_aabb_candidates(queries, character_aabb) {
                 if collider.is_sensor() {
                     continue;
                 }
@@ -334,9 +408,19 @@ impl KinematicCharacterController {
             None,
             None,
         );
+        // [fork 0012] Opt-in: a grounded character does not cast into the ground it stands on.
+        if self.fast_paths.grounded_skip_downward && grounded_at_starting_pos {
+            let down = translation_remaining.dot(self.up);
+            if down < 0.0 {
+                translation_remaining -= self.up * down;
+            }
+        }
 
         let mut max_iters = 20;
         let mut kinematic_friction_translation = Vector::ZERO;
+        // [fork 0011] Pose (and grounded-on-kinematic flag) of the last friction pass whose full
+        // grounded status is still owed.
+        let mut pending_ground: Option<(Pose, bool)> = None;
         let offset = self.offset.eval(dims.y);
         let mut is_moving = false;
 
@@ -400,6 +484,7 @@ impl KinematicCharacterController {
                 }
             } else {
                 // No interference along the path.
+                pending_ground = None;
                 result.translation += translation_remaining;
                 result.grounded = self.detect_grounded_status_and_apply_friction(
                     dt,
@@ -412,19 +497,37 @@ impl KinematicCharacterController {
                 );
                 break;
             }
-            result.grounded = self.detect_grounded_status_and_apply_friction(
+            // [fork 0011] Kinematic friction only (manifolds of colliders with a kinematic parent);
+            // the grounded flag of this pose is computed lazily below, only if no later iteration
+            // overwrites it (stock computed every collider's manifolds here on every iteration).
+            let pose = Pose::from_translation(result.translation) * *character_pos;
+            let grounded_on_kinematic = self.detect_grounded_status_and_apply_friction_ext(
                 dt,
                 queries,
                 character_shape,
-                &(Pose::from_translation(result.translation) * *character_pos),
+                &pose,
                 dims,
                 Some(&mut kinematic_friction_translation),
                 Some(&mut translation_remaining),
+                true,
             );
+            pending_ground = Some((pose, grounded_on_kinematic));
 
             if !self.slide {
                 break;
             }
+        }
+        if let Some((pose, grounded_on_kinematic)) = pending_ground {
+            result.grounded = grounded_on_kinematic
+                || self.detect_grounded_status_and_apply_friction(
+                    dt,
+                    queries,
+                    character_shape,
+                    &pose,
+                    dims,
+                    None,
+                    None,
+                );
         }
         // When not moving, `detect_grounded_status_and_apply_friction` is not reached
         // so we call it explicitly here.
@@ -440,7 +543,10 @@ impl KinematicCharacterController {
             );
         }
         // If needed, and if we are not already grounded, snap to the ground.
-        if grounded_at_starting_pos {
+        // [fork 0012] Opt-in: really skip the snap cast when already grounded.
+        if grounded_at_starting_pos
+            && !(self.fast_paths.snap_only_if_not_grounded && result.grounded)
+        {
             self.snap_to_ground(
                 queries,
                 character_shape,
@@ -500,8 +606,34 @@ impl KinematicCharacterController {
         character_shape: &dyn Shape,
         character_pos: &Pose,
         dims: Vector2<Real>,
+        kinematic_friction_translation: Option<&mut Vector>,
+        translation_remaining: Option<&mut Vector>,
+    ) -> bool {
+        self.detect_grounded_status_and_apply_friction_ext(
+            dt,
+            queries,
+            character_shape,
+            character_pos,
+            dims,
+            kinematic_friction_translation,
+            translation_remaining,
+            false,
+        )
+    }
+
+    /// [fork 0011] `kinematic_only`: skip colliders without a kinematic parent (they contribute
+    /// no kinematic friction), so the result is only the grounded status on kinematic bodies.
+    #[allow(clippy::too_many_arguments)]
+    fn detect_grounded_status_and_apply_friction_ext(
+        &self,
+        dt: Real,
+        queries: &QueryPipeline,
+        character_shape: &dyn Shape,
+        character_pos: &Pose,
+        dims: Vector2<Real>,
         mut kinematic_friction_translation: Option<&mut Vector>,
         mut translation_remaining: Option<&mut Vector>,
+        kinematic_only: bool,
     ) -> bool {
         let prediction = self.predict_ground(dims.y);
 
@@ -515,7 +647,15 @@ impl KinematicCharacterController {
 
         let mut grounded = false;
 
-        'outer: for (_, collider) in queries.intersect_aabb_conservative(character_aabb) {
+        'outer: for (_, collider) in kcc_aabb_candidates(queries, character_aabb) {
+            if kinematic_only
+                && !collider
+                    .parent
+                    .and_then(|p| queries.bodies.get(p.handle))
+                    .is_some_and(|rb| rb.is_kinematic())
+            {
+                continue;
+            }
             manifolds.clear();
             let pos12 = character_pos.inv_mul(collider.position());
             let _ = dispatcher.contact_manifolds(
@@ -538,11 +678,22 @@ impl KinematicCharacterController {
                     .filter(|rb| rb.is_kinematic());
 
                 for m in &manifolds {
-                    if self.is_grounded_at_contact_manifold(m, character_pos, dims) {
+                    let ground_manifold = self.is_grounded_at_contact_manifold(m, character_pos, dims);
+                    if ground_manifold {
                         grounded = true;
                     }
+                    // [fork 0025] Which parts of the kinematic transfer this manifold may apply.
+                    let (carry_normal, carry_tangent) = match self.kinematic_carry {
+                        KinematicCarry::AllContacts => (true, true),
+                        KinematicCarry::TangentFromGroundOnly => (true, ground_manifold),
+                        KinematicCarry::GroundOnly => (ground_manifold, ground_manifold),
+                        KinematicCarry::SidesPushOnly => (true, ground_manifold),
+                    };
+                    // [fork 0026] one-sided normal transfer on side contacts.
+                    let push_only =
+                        self.kinematic_carry == KinematicCarry::SidesPushOnly && !ground_manifold;
 
-                    if let Some(kinematic_parent) = kinematic_parent {
+                    if let Some(kinematic_parent) = kinematic_parent.filter(|_| carry_normal || carry_tangent) {
                         let mut num_active_contacts = 0;
                         let mut manifold_center = Vector::ZERO;
                         let normal = -(character_pos.rotation * m.local_n1);
@@ -557,12 +708,16 @@ impl KinematicCharacterController {
                                 let normal_current_mvt = translation_remaining.dot(normal);
 
                                 manifold_center += contact_point;
-                                *translation_remaining +=
-                                    normal * (normal_target_mvt - normal_current_mvt);
+                                if carry_normal
+                                    && (!push_only || normal_target_mvt > normal_current_mvt)
+                                {
+                                    *translation_remaining +=
+                                        normal * (normal_target_mvt - normal_current_mvt);
+                                }
                             }
                         }
 
-                        if num_active_contacts > 0 {
+                        if num_active_contacts > 0 && carry_tangent {
                             let target_vel = kinematic_parent
                                 .velocity_at_point(manifold_center / num_active_contacts as Real);
                             let tangent_platform_mvt =
@@ -758,6 +913,24 @@ impl KinematicCharacterController {
             queries.filter.flags |= QueryFilterFlags::EXCLUDE_DYNAMIC;
         }
 
+        // [fork 0012] Opt-in: an obstacle whose top is higher than a step cannot be stepped on.
+        if self.fast_paths.autostep_height_precheck {
+            if let Some(co) = queries.colliders.get(stair_handle) {
+                if let (Some(obstacle), Some(character)) =
+                    (co.shape().as_support_map(), character_shape.as_support_map())
+                {
+                    let local_up = co.position().rotation.inverse() * self.up;
+                    let top = (co.position() * obstacle.local_support_point(local_up)).dot(self.up);
+                    let char_down = character_pos.rotation.inverse() * -self.up;
+                    let feet =
+                        (character_pos * character.local_support_point(char_down)).dot(self.up);
+                    if top - feet > max_height {
+                        return false;
+                    }
+                }
+            }
+        }
+
         let shifted_character_pos = Pose::from_parts(
             character_pos.translation + self.up * max_height,
             character_pos.rotation,
@@ -807,7 +980,8 @@ impl KinematicCharacterController {
 
         // Check that we are not getting into a ramp that is too steep
         // after stepping.
-        if let Some((_, hit)) = queries.cast_shape(
+        // [fork 0011] The step-height cast below is this exact query: keep its result.
+        let step_down_hit = queries.cast_shape(
             &Pose::from_parts(
                 shifted_character_pos.translation + horizontal_dir * min_width,
                 shifted_character_pos.rotation,
@@ -820,7 +994,8 @@ impl KinematicCharacterController {
                 max_time_of_impact: max_height,
                 compute_impact_geometry_on_penetration: true,
             },
-        ) {
+        );
+        if let Some((_, hit)) = step_down_hit {
             let [vertical_slope_translation, horizontal_slope_translation] = self
                 .split_into_components(*translation_remaining)
                 .map(|remaining| subtract_hit(remaining, &hit));
@@ -840,21 +1015,7 @@ impl KinematicCharacterController {
 
         // We can step, we need to find the actual step height.
         let step_height = max_height
-            - queries
-                .cast_shape(
-                    &Pose::from_parts(
-                        shifted_character_pos.translation + horizontal_dir * min_width,
-                        shifted_character_pos.rotation,
-                    ),
-                    -self.up,
-                    character_shape,
-                    ShapeCastOptions {
-                        target_distance: offset,
-                        stop_at_penetration: false,
-                        max_time_of_impact: max_height,
-                        compute_impact_geometry_on_penetration: true,
-                    },
-                )
+            - step_down_hit
                 .map(|hit| hit.1.time_of_impact)
                 .unwrap_or(max_height);
 
@@ -928,7 +1089,7 @@ impl KinematicCharacterController {
             .compute_aabb(&collision.character_pos)
             .loosened(prediction);
 
-        for (_, collider) in queries.as_ref().intersect_aabb_conservative(character_aabb) {
+        for (_, collider) in kcc_aabb_candidates(&queries.as_ref(), character_aabb) {
             if let Some(parent) = collider.parent {
                 if let Some(body) = queries.bodies.get(parent.handle) {
                     if body.is_dynamic() {
@@ -978,6 +1139,130 @@ impl KinematicCharacterController {
             }
         }
     }
+
+    /// [fork 0024] Read-only first half of [`Self::solve_character_collision_impulses`]: gathers, for the given
+    /// collisions of one character, every dynamic-body contact the stock push would use (the AABB query and the
+    /// contact manifolds, i.e. all of the push's geometry work) into `out`, without touching any body.
+    ///
+    /// The push only changes body *velocities*; the gathered geometry depends only on collider poses, body types
+    /// and the query filter, which the push does not change. So the gather of every character can run in parallel
+    /// against the frozen world, and [`Self::apply_character_collision_impulses`] called serially in the stock
+    /// character order then gives a world that is bit-identical to calling `solve_character_collision_impulses` for
+    /// each character in that order (same per-body arithmetic in the same order, same mutable accesses in the same
+    /// order, hence the same modified-body set). `out` is cleared first.
+    pub fn prepare_character_collision_impulses<'a>(
+        &self,
+        dt: Real,
+        queries: &QueryPipeline,
+        character_shape: &dyn Shape,
+        collisions: impl IntoIterator<Item = &'a CharacterCollision>,
+        out: &mut CharacterPush,
+    ) {
+        out.manifolds.clear();
+        out.points.clear();
+        let extents = character_shape.compute_local_aabb().extents();
+        let up_extent = extents.dot(self.up.abs());
+        let prediction = self.predict_ground(up_extent);
+        let dispatcher = DefaultQueryDispatcher;
+        let mut pair_manifolds: Vec<ContactManifold> = vec![];
+        for collision in collisions {
+            let movement_to_transfer =
+                collision.hit.normal1 * collision.translation_remaining.dot(collision.hit.normal1);
+            let character_aabb = character_shape
+                .compute_aabb(&collision.character_pos)
+                .loosened(prediction);
+            let velocity_to_transfer = movement_to_transfer * utils::inv(dt);
+            for (_, collider) in kcc_aabb_candidates(queries, character_aabb) {
+                if let Some(parent) = collider.parent {
+                    if let Some(body) = queries.bodies.get(parent.handle) {
+                        if body.is_dynamic() {
+                            let pos12 = collision.character_pos.inv_mul(collider.position());
+                            pair_manifolds.clear();
+                            let _ = dispatcher.contact_manifolds(
+                                &pos12,
+                                character_shape,
+                                collider.shape(),
+                                prediction,
+                                &mut pair_manifolds,
+                                &mut None,
+                            );
+                            let collider_pos = collider.position();
+                            for m in pair_manifolds.drain(..) {
+                                let normal = collision.character_pos.rotation * m.local_n1;
+                                for pt in &m.points {
+                                    if pt.dist <= prediction {
+                                        out.points.push(collider_pos * pt.local_p2);
+                                    }
+                                }
+                                out.manifolds.push(CharacterPushManifold {
+                                    body: parent.handle,
+                                    normal,
+                                    velocity_to_transfer,
+                                    points_end: out.points.len() as u32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [fork 0024] Serial second half: applies a push gathered by
+    /// [`Self::prepare_character_collision_impulses`] with exactly the stock arithmetic and access order.
+    pub fn apply_character_collision_impulses(
+        &self,
+        bodies: &mut crate::dynamics::RigidBodySet,
+        character_mass: Real,
+        push: &CharacterPush,
+    ) {
+        let mut start = 0usize;
+        for m in &push.manifolds {
+            // Stock takes `&mut bodies[h]` once per manifold, even one without points within the prediction
+            // distance: keep that access (it records the body in the modified set, which affects the next step).
+            let body = &mut bodies[m.body];
+            let end = m.points_end as usize;
+            for contact_point in &push.points[start..end] {
+                let body_mass = body.mass();
+                let contact_point = *contact_point;
+                let delta_vel_per_contact = (m.velocity_to_transfer
+                    - body.velocity_at_point(contact_point))
+                .dot(m.normal);
+                let mass_ratio = body_mass * character_mass / (body_mass + character_mass);
+
+                body.apply_impulse_at_point(
+                    m.normal * delta_vel_per_contact.max(0.0) * mass_ratio,
+                    contact_point,
+                    true,
+                );
+            }
+            start = end;
+        }
+    }
+}
+
+/// [fork 0024] One contact manifold of a gathered character push (see
+/// [`KinematicCharacterController::prepare_character_collision_impulses`]).
+#[derive(Copy, Clone, Debug)]
+pub struct CharacterPushManifold {
+    /// The dynamic body pushed.
+    pub body: crate::dynamics::RigidBodyHandle,
+    /// World-space manifold normal (character towards obstacle), as the stock push uses it.
+    pub normal: Vector,
+    /// The character velocity to transfer along `normal` for the collision this manifold came from.
+    pub velocity_to_transfer: Vector,
+    /// End (exclusive) of this manifold's contact points in [`CharacterPush::points`].
+    pub points_end: u32,
+}
+
+/// [fork 0024] The gathered push of one character: manifolds in the stock visit order and their contact points
+/// (world space, only those within the prediction distance).
+#[derive(Clone, Debug, Default)]
+pub struct CharacterPush {
+    /// Manifolds in the order the stock push visits them.
+    pub manifolds: Vec<CharacterPushManifold>,
+    /// World-space contact points, grouped by manifold.
+    pub points: Vec<Vector>,
 }
 
 fn subtract_hit(translation: Vector, hit: &ShapeCastHit) -> Vector {

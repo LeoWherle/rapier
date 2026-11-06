@@ -147,6 +147,18 @@ impl RigidBodySet {
     /// );
     /// // Store `handle` to access this body later
     /// ```
+    /// [engine-mod-rapier patch] Like [`Self::insert`] but at a caller-chosen arena slot.
+    /// Returns `None` if the slot is occupied.
+    pub fn insert_at(&mut self, index: u32, rb: impl Into<RigidBody>) -> Option<RigidBodyHandle> {
+        let mut rb = rb.into();
+        rb.reset_internal_references();
+        rb.changes.set(RigidBodyChanges::all(), true);
+        let handle = RigidBodyHandle(self.bodies.insert_at(index, rb)?);
+        self.modified_bodies
+            .push_unchecked(handle, &mut self.bodies[handle.0]);
+        Some(handle)
+    }
+
     pub fn insert(&mut self, rb: impl Into<RigidBody>) -> RigidBodyHandle {
         let mut rb = rb.into();
         // Make sure the internal links are reset, they may not be
@@ -382,6 +394,16 @@ impl RigidBodySet {
     ///     println!("Body {:?} is at {:?}", handle, body.translation());
     /// }
     /// ```
+    /// [fork 0021] Replaces the modified set by every body in ascending arena index (each once),
+    /// so its membership and order no longer depend on which bodies were mutably accessed, and in
+    /// what order, since the last step. See `HistoryFreeHandoff::canonical_modified_set`.
+    pub fn canonicalize_modified_set(&mut self) {
+        self.modified_bodies.clear();
+        for (h, rb) in self.bodies.iter_mut() {
+            self.modified_bodies.push_unchecked(RigidBodyHandle(h), rb);
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (RigidBodyHandle, &RigidBody)> {
         self.bodies.iter().map(|(h, b)| (RigidBodyHandle(h), b))
     }

@@ -408,6 +408,56 @@ pub struct NarrowPhase {
     /// step) skip the buffer reallocation of freshly constructed pairs.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     retired_pairs: Vec<ContactPair>,
+    /// [fork 0007] Opt-in history-free solver state for exact handoff (default: off = stock).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub history_free: HistoryFreeHandoff,
+    /// [fork 0007] Number of `compute_contacts` calls so far (the recycle-epoch clock).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    fork_step_index: u64,
+    /// [fork 0007] The canonical colouring is up to date (no transition, re-parenting, type
+    /// change, pair removal or import since the last canonical pass).
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    fork_canon_clean: bool,
+}
+
+/// [fork 0007] Opt-in rules that make the narrow phase's solver-facing state a function of the
+/// current world state (plus a bounded, globally scheduled window), instead of the whole
+/// history, so a world that received bodies by handoff evolves like one that always held them.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryFreeHandoff {
+    /// Re-derive every touching pair's solver colour (= its Gauss-Seidel rank) from scratch in
+    /// canonical `(min body index, max body index, edge)` order whenever the touching set or a
+    /// body's type changed. Stock colouring is incremental: a pair keeps the colour it got when
+    /// it began touching, so colours (and results) depend on the order of past events.
+    pub canonical_coloring: bool,
+    /// `0` = stock contact recycling. `N > 0`: every pair gets a full narrow-phase update on
+    /// steps whose index is a multiple of `N` (an *epoch*), and a pair's recycle reference pose
+    /// is re-anchored only there (or when it has none). Recycling decisions then depend only on
+    /// the poses since the last epoch, so a handoff that lands on an epoch step carries no
+    /// recycle history. Requires `IntegrationParameters::contact_recycling`.
+    pub recycle_epoch: u32,
+    /// [fork 0014] Recycle only pairs whose manifolds hold at least one contact point. A
+    /// point-less pair then keeps no recycle reference pose and is fully updated every step,
+    /// exactly like a freshly created one, so whether (and since when) the broad phase kept a
+    /// non-touching pair alive no longer changes results. Pairs with points keep stock
+    /// recycling; their `recycle_state` is part of a handoff payload
+    /// (`RigidPairContacts::recycle_state`). Requires `IntegrationParameters::contact_recycling`.
+    pub recycle_touching_only: bool,
+    /// [fork 0020] Reset the cached normal (`local_n1`/`local_n2`) of every manifold that has no
+    /// contact point, before and after its contact update. Stock parry seeds the convex-convex GJK
+    /// with that normal, so a point-less pair's age changes later contact points (last-ulp) and a
+    /// restored or rebuilt world, whose broad-phase pair set differs, diverges from one that never
+    /// restored. Costs a cold GJK start for separated convex-convex pairs.
+    pub forget_pointless_normals: bool,
+    /// [fork 0021] At the start of every `PhysicsPipeline::step`, make the rigid-body modified
+    /// set = every body, in ascending arena index. Stock membership and order record which bodies
+    /// were mutably accessed (`&mut bodies[h]`, even without a value change) and in what order;
+    /// both reach the step (active-set epoch bump in `IslandManager::rigid_body_updated`, the
+    /// handling of change flags left on bodies that were not in the set, the order in which
+    /// colliders are pushed to the broad phase), so a snapshot restore — which writes every
+    /// restored body — changed later results. Equivalent to touching every body at tick start.
+    pub canonical_modified_set: bool,
 }
 
 pub(crate) type ContactManifoldIndex = usize;
@@ -451,6 +501,9 @@ impl NarrowPhase {
             force_list_valid: false,
             solver_color_todo: Vec::new(),
             soft_self: Default::default(),
+            history_free: HistoryFreeHandoff::default(),
+            fork_step_index: 0,
+            fork_canon_clean: false,
         }
     }
 

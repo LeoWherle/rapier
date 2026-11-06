@@ -30,6 +30,11 @@ pub struct Arena<T> {
     generation: u32,
     free_list_head: Option<u32>,
     len: usize,
+    /// [distribution patch] Slots taken by `insert_at` while still threaded in the free list,
+    /// mapped to their `next_free` link. Allocation skips them lazily, so `insert_at` is O(log n)
+    /// instead of an O(free-list) walk.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    threaded: alloc::collections::BTreeMap<u32, Option<u32>>,
 }
 
 #[cfg(feature = "alloc")]
@@ -140,6 +145,7 @@ impl<T> Arena<T> {
             generation: 0,
             free_list_head: None,
             len: 0,
+            threaded: Default::default(),
         };
         arena.reserve(n);
         arena
@@ -174,6 +180,7 @@ impl<T> Arena<T> {
         }));
         self.free_list_head = Some(0);
         self.len = 0;
+        self.threaded.clear();
     }
 
     /// Attempts to insert `value` into the arena using existing capacity.
@@ -257,6 +264,14 @@ impl<T> Arena<T> {
 
     #[inline]
     fn try_alloc_next_index(&mut self) -> Option<Index> {
+        // [distribution patch] skip slots taken by `insert_at` that are still threaded.
+        while let Some(i) = self.free_list_head {
+            if let Entry::Occupied { .. } = self.items[i as usize] {
+                self.free_list_head = self.threaded.remove(&i).expect("corrupt free list");
+            } else {
+                break;
+            }
+        }
         match self.free_list_head {
             None => None,
             Some(i) => match self.items[i as usize] {
@@ -286,6 +301,44 @@ impl<T> Arena<T> {
     /// let idx = arena.insert(42);
     /// assert_eq!(arena[idx], 42);
     /// ```
+    /// [engine-mod-rapier patch] Inserts `value` at the caller-chosen slot `index` (stable,
+    /// user-chosen IDs). Grows the arena as needed. O(1) when `index` is the free-list head
+    /// (e.g. ascending creation); otherwise O(log n) (the slot stays threaded in the free list
+    /// and is skipped lazily by later allocations).
+    /// Returns `None` if the slot is occupied.
+    pub fn insert_at(&mut self, index: u32, value: T) -> Option<Index> {
+        let i = index as usize;
+        if i >= self.items.len() {
+            // New slots [len, i]: link [len, i) ascending in front of the old free list, then `i`.
+            let start = self.items.len();
+            let old_head = self.free_list_head;
+            self.items.reserve(i + 1 - start);
+            for k in start..i {
+                let next = if k + 1 < i { Some(k as u32 + 1) } else { old_head };
+                self.items.push(Entry::Free { next_free: next });
+            }
+            if i > start {
+                self.free_list_head = Some(start as u32);
+            }
+            self.items.push(Entry::Occupied { generation: self.generation, value });
+            self.len += 1;
+            return Some(Index { index, generation: self.generation });
+        }
+        let next_free = match self.items[i] {
+            Entry::Occupied { .. } => return None,
+            Entry::Free { next_free } => next_free,
+        };
+        if self.free_list_head == Some(index) {
+            self.free_list_head = next_free;
+        } else {
+            // [distribution patch] O(log n): leave the slot threaded, remember its link.
+            self.threaded.insert(index, next_free);
+        }
+        self.items[i] = Entry::Occupied { generation: self.generation, value };
+        self.len += 1;
+        Some(Index { index, generation: self.generation })
+    }
+
     #[inline]
     pub fn insert(&mut self, value: T) -> Index {
         match self.try_insert(value) {
@@ -357,14 +410,19 @@ impl<T> Arena<T> {
 
         match self.items[i.index as usize] {
             Entry::Occupied { generation, .. } if i.generation == generation => {
+                // [distribution patch] a still-threaded slot goes back to its old chain position.
+                let (next_free, push_head) = match self.threaded.remove(&i.index) {
+                    Some(nf) => (nf, false),
+                    None => (self.free_list_head, true),
+                };
                 let entry = mem::replace(
                     &mut self.items[i.index as usize],
-                    Entry::Free {
-                        next_free: self.free_list_head,
-                    },
+                    Entry::Free { next_free },
                 );
                 self.generation += 1;
-                self.free_list_head = Some(i.index);
+                if push_head {
+                    self.free_list_head = Some(i.index);
+                }
                 self.len -= 1;
 
                 match entry {
@@ -739,6 +797,7 @@ impl<T> Arena<T> {
     /// assert!(arena.get(idx_2).is_none());
     /// ```
     pub fn drain(&mut self) -> Drain<'_, T> {
+        self.threaded.clear();
         Drain {
             inner: self.items.drain(..).enumerate(),
         }

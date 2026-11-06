@@ -261,7 +261,19 @@ pub(super) unsafe fn solve_pass(
     }
 
     // Contact color stages (ascending color id).
-    for (_, chunk_range) in &ctx.color_ranges[group.colors.clone()] {
+    for (color, chunk_range) in &ctx.color_ranges[group.colors.clone()] {
+        if *color == super::SERIAL_RUN_COLOR {
+            // [fork 0006] a run of small colours at its rank: worker 0, serially.
+            let n = chunk_range.len();
+            if worker_id == 0 {
+                for chunk_id in chunk_range.clone() {
+                    solve_chunk(chunk_id);
+                }
+                sync.complete(stage, n, n);
+            }
+            stage = sync.sync(stage, n);
+            continue;
+        }
         let virt = 0..chunk_range.end - chunk_range.start;
         let mut done = 0;
         while let Some(claimed) = sync.claim(

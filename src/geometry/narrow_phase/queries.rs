@@ -16,6 +16,21 @@ impl NarrowPhase {
         &self.body_solver_color_masks
     }
 
+    /// [fork 0005] Resets every manifold's solver-graph back-reference and forces a full
+    /// solver-graph rebuild at the next step. Call after editing pairs in place through
+    /// [`Self::contact_pair_mut`] with data from another world (prefer
+    /// [`Self::import_contact_pair`], which does this for the imported pair).
+    pub fn invalidate_solver_graph(&mut self) {
+        for e in self.contact_graph.graph.edges.iter_mut() {
+            if let Some(r) = e.weight.rigid_mut() {
+                for m in r.manifolds.iter_mut().chain(r.solver_clusters.iter_mut()) {
+                    m.data.graph_pos = crate::dynamics::solver::solver_contact_graph::GraphPos::NONE;
+                }
+            }
+        }
+        self.solver_graph_valid = false;
+    }
+
     /// The query dispatcher used by this narrow-phase to select the right collision-detection
     /// algorithms depending on the shape types.
     pub fn query_dispatcher(
@@ -147,7 +162,7 @@ impl NarrowPhase {
 
     /// Mutable access to the contact pair involving two specific colliders (the soft-body
     /// solver writes its contact impulses back through it).
-    pub(crate) fn contact_pair_mut(
+    pub fn contact_pair_mut(
         &mut self,
         collider1: ColliderHandle,
         collider2: ColliderHandle,

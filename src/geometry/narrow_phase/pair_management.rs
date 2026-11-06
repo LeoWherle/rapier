@@ -18,6 +18,24 @@ use crate::pipeline::{ActiveEvents, EventHandler};
 use crate::prelude::CollisionEventFlags;
 use parry::utils::hashmap::HashMap;
 
+/// [fork 0005] Drops the world-local solver state an exported pair carries: solver-graph
+/// back-references (`graph_pos`) and the solver colour (whose bits live in the *source*
+/// world's per-body masks).
+fn sanitize_imported_pair(pair: &mut ContactPair) {
+    if let Some(r) = pair.rigid_mut() {
+        for m in r
+            .manifolds
+            .iter_mut()
+            .chain(r.solver_clusters.iter_mut())
+            .chain(r.solver_clusters_prev.iter_mut())
+        {
+            m.data.graph_pos = GraphPos::NONE;
+        }
+        r.solver_color = crate::geometry::contact_pair::SOLVER_COLOR_UNCOLORED;
+        r.solver_color_bodies = [u32::MAX; 2];
+    }
+}
+
 impl NarrowPhase {
     /// Maintain the narrow-phase internal state by taking collider removal into account.
     #[profiling::function]
@@ -242,7 +260,11 @@ impl NarrowPhase {
                     let deformed_only = (co.changes
                         & !(ColliderChanges::IN_MODIFIED_SET | ColliderChanges::DEFORMED))
                         .is_empty();
-                    if let Some(islands) = islands.as_deref_mut().filter(|_| !deformed_only) {
+                    // [fork 0016] a quiet handoff import wakes neither the body nor its partners.
+                    let quiet = co.parent.as_ref().is_some_and(|p| {
+                        bodies.get(p.handle).is_some_and(|rb| rb.activation.handoff_quiet)
+                    });
+                    if let Some(islands) = islands.as_deref_mut().filter(|_| !deformed_only && !quiet) {
                         if let Some(co_parent) = &co.parent {
                             islands.wake_up(bodies, co_parent.handle, true);
                         }
@@ -268,6 +290,7 @@ impl NarrowPhase {
                     if co.changes.intersects(
                         ColliderChanges::PARENT | ColliderChanges::PARENT_EFFECTIVE_DOMINANCE,
                     ) {
+                        self.fork_canon_clean = false; // [fork 0007]
                         let mut edges_to_recolor = alloc::vec::Vec::new();
                         for edge in self.contact_graph.graph.edges(gid.contact_graph_index) {
                             edges_to_recolor.push(edge.id().index());
@@ -361,6 +384,15 @@ impl NarrowPhase {
                     //       collider. If needed, their collision/intersection data will be
                     //       updated/removed automatically in the contact or intersection update
                     //       functions.
+                }
+            }
+        }
+
+        // [fork 0016] the quiet-import window lasts one user-change pass.
+        for handle in modified_colliders {
+            if let Some(p) = colliders.get(*handle).and_then(|co| co.parent.as_ref()) {
+                if let Some(rb) = bodies.get_mut_internal(p.handle) {
+                    rb.activation.handoff_quiet = false;
                 }
             }
         }
@@ -544,6 +576,7 @@ impl NarrowPhase {
                     // Also wake up the dynamic bodies that were in contact.
                     if let Some(mut ctct) = contact_pair {
                         clear_pair_solver_color(&mut self.body_solver_color_masks, &mut ctct);
+                        self.fork_canon_clean = false; // [fork 0007]
 
                         if ctct.has_any_active_contact() {
                             if let Some(islands) = islands {
@@ -571,6 +604,132 @@ impl NarrowPhase {
                 }
             }
         }
+    }
+
+    /// [engine-mod-rapier patch] Inserts a contact pair (e.g. exported from another world, with its
+    /// manifolds and warm-start impulses) *before* the broad phase reports it. The broad phase's later
+    /// `AddPair` event finds the edge and keeps it, so the first solve warm-starts from `pair`.
+    /// Returns `false` (and drops `pair`) if a collider is missing, is a sensor, or the edge exists.
+    pub fn insert_contact_pair(&mut self, colliders: &ColliderSet, mut pair: ContactPair) -> bool {
+        // [fork 0005] never keep the source world's solver-graph back-refs / colour.
+        sanitize_imported_pair(&mut pair);
+        self.insert_contact_pair_edge(colliders, pair).is_some()
+    }
+
+    /// [fork 0005] Imports a contact pair exported from another world (e.g. a handoff), into
+    /// this narrow phase: replaces the existing edge `(collider1, collider2)` if there is one
+    /// (same orientation only), otherwise inserts it before the broad phase reports it.
+    ///
+    /// Unlike a raw copy, this keeps the narrow phase consistent with the pair:
+    /// - the source world's solver-graph back-references (`ContactManifoldData::graph_pos`)
+    ///   are reset and the solver graph is rebuilt at the next step (a stale `graph_pos`
+    ///   panics in `SolverContactGraph::rewrite_edge` on a later edge swap-remove);
+    /// - the replaced pair's solver colour is released, and the imported pair (if touching) is
+    ///   coloured against *this* world's per-body colour masks (the source colour bits are not
+    ///   in these masks: keeping them can give two same-colour pairs a common body);
+    /// - its solver hint is count-cleared (recomputed at the next update);
+    /// - a touching pair is linked into the persistent islands.
+    ///
+    /// Returns `false` (and drops `pair`) if a collider is missing or is a sensor, or if the edge
+    /// exists with the opposite collider order.
+    pub fn import_contact_pair(
+        &mut self,
+        islands: &mut IslandManager,
+        bodies: &mut RigidBodySet,
+        colliders: &ColliderSet,
+        mut pair: ContactPair,
+    ) -> bool {
+        sanitize_imported_pair(&mut pair);
+        if let Some(r) = pair.rigid_mut() {
+            r.import_keep_recycle = r.recycle_state.is_some(); // [fork 0015]
+        }
+        let (c1, c2) = (pair.collider1, pair.collider2);
+        let existing = match (self.graph_indices.get(c1.0), self.graph_indices.get(c2.0)) {
+            (Some(g1), Some(g2)) => self
+                .contact_graph
+                .graph
+                .find_edge(g1.contact_graph_index, g2.contact_graph_index),
+            _ => None,
+        };
+        let edge_id = if let Some(eid) = existing {
+            let eid = eid.index();
+            let ex = &mut self.contact_graph.graph.edges[eid].weight;
+            if ex.collider1 != c1 {
+                return false;
+            }
+            clear_pair_solver_color(&mut self.body_solver_color_masks, ex);
+            *ex = pair;
+            if let Some(h) = self.pair_solver_hints.get_mut(eid) {
+                *h = 0;
+            }
+            islands.persistent.unlink_contact(eid as u32);
+            eid
+        } else {
+            match self.insert_contact_pair_edge(colliders, pair) {
+                Some(eid) => eid,
+                None => return false,
+            }
+        };
+        self.solver_graph_valid = false;
+        self.fork_canon_clean = false; // [fork 0007]
+        let pair = &mut self.contact_graph.graph.edges[edge_id].weight;
+        if pair.has_any_active_contact() {
+            let parent = |co: ColliderHandle| colliders.get(co).and_then(|c| c.parent.map(|p| p.handle));
+            let (h1, h2) = (parent(c1), parent(c2));
+            let info = |h: Option<crate::dynamics::RigidBodyHandle>| {
+                h.map(|h| (h.into_raw_parts().0, bodies[h].is_fixed()))
+            };
+            assign_pair_solver_color(&mut self.body_solver_color_masks, pair, info(h1), info(h2));
+            islands.persistent.link_contact(bodies, edge_id as u32, h1, h2);
+        }
+        true
+    }
+
+    /// [fork 0005] The v2 `insert_contact_pair` body; returns the new edge id.
+    fn insert_contact_pair_edge(&mut self, colliders: &ColliderSet, pair: ContactPair) -> Option<usize> {
+        let (Some(co1), Some(co2)) = (colliders.get(pair.collider1), colliders.get(pair.collider2))
+        else {
+            return None;
+        };
+        if co1.is_sensor() || co2.is_sensor() {
+            return None;
+        }
+        let (gid1, gid2) = self.graph_indices.ensure_pair_exists(
+            pair.collider1.0,
+            pair.collider2.0,
+            ColliderGraphIndices::invalid(),
+        );
+        if !InteractionGraph::<(), ()>::is_graph_index_valid(gid1.contact_graph_index) {
+            gid1.contact_graph_index = self.contact_graph.graph.add_node(pair.collider1);
+        }
+        if !InteractionGraph::<(), ()>::is_graph_index_valid(gid2.contact_graph_index) {
+            gid2.contact_graph_index = self.contact_graph.graph.add_node(pair.collider2);
+        }
+        if self
+            .contact_graph
+            .graph
+            .find_edge(gid1.contact_graph_index, gid2.contact_graph_index)
+            .is_some()
+        {
+            return None;
+        }
+        if self.pair_solver_hints.len() == self.contact_graph.graph.edges.len() {
+            self.pair_solver_hints.push(0);
+        } else {
+            self.pair_solver_hints.clear();
+        }
+        if self.force_event_pos.len() == self.contact_graph.graph.edges.len() {
+            self.force_event_pos.push(u32::MAX);
+        } else {
+            self.force_event_pos.clear();
+            self.force_event_pairs.clear();
+            self.force_list_valid = false;
+        }
+        let (i1, i2) = (gid1.contact_graph_index, gid2.contact_graph_index);
+        let eid = self.contact_graph.add_edge(i1, i2, pair);
+        self.solver_graph_valid = false;
+        self.fork_canon_clean = false; // [fork 0007]
+        Some(eid.index())
     }
 
     #[profiling::function]

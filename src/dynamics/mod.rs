@@ -23,6 +23,10 @@ pub use self::rigid_body_handle::RigidBodyHandle;
 pub(crate) use self::rigid_body_set::ModifiedRigidBodies;
 #[cfg(feature = "alloc")]
 pub(crate) use self::solver::StagedIslandSolver;
+#[cfg(feature = "alloc")]
+pub use self::solver::{
+    group_parallel_dispatch, group_parallel_dispatch_count, set_group_parallel_dispatch,
+};
 pub use parry::mass_properties::MassProperties;
 
 #[cfg(feature = "alloc")]
