@@ -126,7 +126,11 @@ pub(super) fn process_pair(
                 | ColliderChanges::POSITION
                 | ColliderChanges::LOCAL_MASS_PROPERTIES;
             if import_keep_recycle {
-                recycle_safe |= ColliderChanges::PARENT_EFFECTIVE_DOMINANCE;
+                // [fork 0019] ... and any change flag of a re-inserted collider (world-per-group
+                // merge: `insert_with_parent_at` sets `ColliderChanges::all()`). The pair was computed
+                // in the source world with the same shapes, groups and types; only the pose test
+                // below decides, as in the source world.
+                recycle_safe = ColliderChanges::all();
             }
             let hooks_involved = !(co1.flags.active_hooks | co2.flags.active_hooks).is_empty();
 

@@ -289,7 +289,9 @@ pub struct RigidPairContacts {
     /// [fork 0015] Set by `NarrowPhase::import_contact_pair` on a pair imported with a recycle
     /// state: its next update may recycle although the import flipped a body type (the source
     /// world computed the pair with the bodies' final types). Cleared by that update.
-    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    /// [fork 0019] serialized, so it survives a world snapshot taken between import and step
+    /// (world-per-group: merge, then ship the merged world).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) import_keep_recycle: bool,
     /// The soft contacts of a soft-rigid pair beside its manifolds (the predictive vertex
     /// contacts and the volume patch, see `SoftRigidContacts`), rebuilt by every update; `None`
