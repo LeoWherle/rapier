@@ -1509,7 +1509,15 @@ impl RigidBodyActivation {
             RigidBodyType::KinematicPositionBased | RigidBodyType::KinematicVelocityBased => {
                 // Platforms only sleep if both velocities are exactly zero. If it’s not exactly
                 // zero, then the user really wants them to move.
-                sq_linvel == 0.0 && sq_angvel == 0.0
+                // [fork 0023] A negative threshold means "never sleeps" for kinematic bodies too
+                // (`RigidBodyBuilder::can_sleep(false)`, `RigidBodyActivation::cannot_sleep()`):
+                // stock ignored the thresholds here, so a standing kinematic body (e.g. a character
+                // controller's body) fell asleep anyway and kept a sleep timer whose value depended
+                // on strong wakes (snapshot restores), not only on its motion.
+                self.normalized_linear_threshold >= 0.0
+                    && self.angular_threshold >= 0.0
+                    && sq_linvel == 0.0
+                    && sq_angvel == 0.0
             }
             RigidBodyType::Fixed => true,
         };
