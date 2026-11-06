@@ -312,6 +312,10 @@ impl StagedIslandSolver {
         self.overflow_chunk_refs.clear();
         self.grouped_chunk_refs.clear();
         self.color_ranges.clear();
+        self.team_groups.clear();
+        self.solo_groups.clear();
+        self.solo_units.clear();
+        self.solo_cursor.store(0, Ordering::Relaxed);
         let mut next_chunk = 0usize;
 
         // NOTE: the SIMD builders handle per-lane active-contact counts, so a color's whole
@@ -429,12 +433,19 @@ impl StagedIslandSolver {
             // A manifold's group: max group index over its in-island solver bodies. Both sides
             // agree for dynamic-dynamic pairs (constraints never span groups by construction);
             // for kinematic-dynamic the max picks the dynamic side.
+            // [fork 0008] Also links groups whose slots one manifold touches (a kinematic body
+            // lifted into one group and touching another group's dynamic body): such groups are
+            // coupled through that body and must keep their relative ring order (union-find).
+            let coupling = core::cell::RefCell::new(GroupUnionFind::new(num_groups));
             let group_of = |r: &ContactRef| -> usize {
                 let mut gi = 0u16;
                 let mut found = false;
                 for id in store.get(*r).data.solver_body_ids {
                     if let Some(&g) = slot_group.get(id as usize) {
                         if g != u16::MAX {
+                            if found && g != gi {
+                                coupling.borrow_mut().union(g as usize, gi as usize);
+                            }
                             gi = gi.max(g);
                             found = true;
                         }
@@ -535,6 +546,80 @@ impl StagedIslandSolver {
             // stability of the segment refs).
             debug_assert_eq!(self.grouped_chunk_refs.capacity(), grouped_cap);
             debug_assert_eq!(self.overflow_chunk_refs.capacity(), overflow_cap);
+
+            // [fork 0008] Group-parallel dispatch plan. Groups linked by a contact or joint (see
+            // `coupling`) form a unit solved in ring order by one worker; distinct units write
+            // disjoint solver bodies and constraints, so they can be solved concurrently in any
+            // order with bit-identical results (the stage sequence of a group is the same with 1 or
+            // N workers). Not used with soft bodies, FEM or multibodies (their worker-0 stages are
+            // not all group-local). A unit holding a group larger than twice a worker's fair share
+            // of the chunks with a parallel colour stays on the lockstep team ring (in order).
+            let mut coupling = coupling.into_inner();
+            for ji in joint_indices {
+                let joint = &impulse_joints[*ji].weight;
+                let mut seen = u16::MAX;
+                for handle in [joint.body1, joint.body2] {
+                    if let Some(rb) = bodies.get(handle) {
+                        if !rb.is_fixed() && !rb.is_sleeping() {
+                            if let Some(&g) = slot_group.get(rb.ids.active_set_id as usize) {
+                                if g != u16::MAX {
+                                    if seen != u16::MAX && seen != g {
+                                        coupling.union(seen as usize, g as usize);
+                                    }
+                                    seen = g;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "fem")]
+            let has_fem = !self.soft_fem.is_empty();
+            #[cfg(not(feature = "fem"))]
+            let has_fem = false;
+            let eligible = cfg!(feature = "parallel")
+                && super::group_parallel_dispatch()
+                && num_workers > 1
+                && num_soft_slots == 0
+                && !has_fem
+                && self.velocity_solver.multibody_roots.is_empty();
+            if eligible {
+                // Units in order of their first group; a unit's groups ascending.
+                let mut unit_team = alloc::vec![false; num_groups];
+                for (gi, g) in self.groups.iter().enumerate() {
+                    let has_parallel_color = self.color_ranges[g.colors.clone()]
+                        .iter()
+                        .any(|(c, _)| *c != SERIAL_RUN_COLOR)
+                        || !g.joint_colors.is_empty();
+                    if has_parallel_color && g.chunks.len() * num_workers >= 2 * next_chunk {
+                        unit_team[coupling.find(gi)] = true;
+                    }
+                }
+                let mut unit_slot = alloc::vec![u32::MAX; num_groups];
+                let mut members: Vec<Vec<u32>> = Vec::new();
+                for gi in 0..num_groups {
+                    let root = coupling.find(gi);
+                    if unit_team[root] {
+                        self.team_groups.push(gi as u32);
+                        continue;
+                    }
+                    if unit_slot[root] == u32::MAX {
+                        unit_slot[root] = members.len() as u32;
+                        members.push(Vec::new());
+                    }
+                    members[unit_slot[root] as usize].push(gi as u32);
+                }
+                if members.len() >= 2 {
+                    for m in &members {
+                        self.solo_units.push(self.solo_groups.len() as u32);
+                        self.solo_groups.extend_from_slice(m);
+                    }
+                    self.solo_units.push(self.solo_groups.len() as u32);
+                    super::count_group_parallel_dispatch();
+                } else {
+                    self.team_groups.clear();
+                }
+            }
         }
 
         // Every SIMD chunk (parallel colors AND the serial overflow tail) needs lane-disjoint
@@ -674,6 +759,10 @@ impl StagedIslandSolver {
             any_gyroscopic: &self.any_gyroscopic as *const _,
             any_ccd_active: &self.any_ccd_active as *const _,
             any_bouncy: &self.any_bouncy as *const _,
+            team_groups: &self.team_groups,
+            solo_groups: &self.solo_groups,
+            solo_units: &self.solo_units,
+            solo_cursor: &self.solo_cursor,
         };
 
         let ctx_ref = &ctx;
@@ -719,5 +808,27 @@ impl StagedIslandSolver {
             .multibody_roots
             .is_empty()
             .then(|| self.any_ccd_active.load(Ordering::Relaxed));
+    }
+}
+
+/// [fork 0008] Tiny union-find over solve-group indices (path halving, union by index).
+struct GroupUnionFind(Vec<u32>);
+impl GroupUnionFind {
+    fn new(n: usize) -> Self {
+        Self((0..n as u32).collect())
+    }
+    fn find(&mut self, mut i: usize) -> usize {
+        while self.0[i] as usize != i {
+            self.0[i] = self.0[self.0[i] as usize];
+            i = self.0[i] as usize;
+        }
+        i
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            self.0[hi] = lo as u32;
+        }
     }
 }
