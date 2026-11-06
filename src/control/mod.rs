@@ -2,6 +2,7 @@
 
 #[cfg(feature = "alloc")]
 pub use self::character_controller::{
+    CharacterPush, CharacterPushManifold,
     KCC_CANONICAL_ORDER,
     CharacterAutostep, CharacterCollision, CharacterFastPaths, CharacterLength,
     EffectiveCharacterMovement, KinematicCharacterController,

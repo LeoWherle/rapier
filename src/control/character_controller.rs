@@ -1090,6 +1090,130 @@ impl KinematicCharacterController {
             }
         }
     }
+
+    /// [fork 0024] Read-only first half of [`Self::solve_character_collision_impulses`]: gathers, for the given
+    /// collisions of one character, every dynamic-body contact the stock push would use (the AABB query and the
+    /// contact manifolds, i.e. all of the push's geometry work) into `out`, without touching any body.
+    ///
+    /// The push only changes body *velocities*; the gathered geometry depends only on collider poses, body types
+    /// and the query filter, which the push does not change. So the gather of every character can run in parallel
+    /// against the frozen world, and [`Self::apply_character_collision_impulses`] called serially in the stock
+    /// character order then gives a world that is bit-identical to calling `solve_character_collision_impulses` for
+    /// each character in that order (same per-body arithmetic in the same order, same mutable accesses in the same
+    /// order, hence the same modified-body set). `out` is cleared first.
+    pub fn prepare_character_collision_impulses<'a>(
+        &self,
+        dt: Real,
+        queries: &QueryPipeline,
+        character_shape: &dyn Shape,
+        collisions: impl IntoIterator<Item = &'a CharacterCollision>,
+        out: &mut CharacterPush,
+    ) {
+        out.manifolds.clear();
+        out.points.clear();
+        let extents = character_shape.compute_local_aabb().extents();
+        let up_extent = extents.dot(self.up.abs());
+        let prediction = self.predict_ground(up_extent);
+        let dispatcher = DefaultQueryDispatcher;
+        let mut pair_manifolds: Vec<ContactManifold> = vec![];
+        for collision in collisions {
+            let movement_to_transfer =
+                collision.hit.normal1 * collision.translation_remaining.dot(collision.hit.normal1);
+            let character_aabb = character_shape
+                .compute_aabb(&collision.character_pos)
+                .loosened(prediction);
+            let velocity_to_transfer = movement_to_transfer * utils::inv(dt);
+            for (_, collider) in kcc_aabb_candidates(queries, character_aabb) {
+                if let Some(parent) = collider.parent {
+                    if let Some(body) = queries.bodies.get(parent.handle) {
+                        if body.is_dynamic() {
+                            let pos12 = collision.character_pos.inv_mul(collider.position());
+                            pair_manifolds.clear();
+                            let _ = dispatcher.contact_manifolds(
+                                &pos12,
+                                character_shape,
+                                collider.shape(),
+                                prediction,
+                                &mut pair_manifolds,
+                                &mut None,
+                            );
+                            let collider_pos = collider.position();
+                            for m in pair_manifolds.drain(..) {
+                                let normal = collision.character_pos.rotation * m.local_n1;
+                                for pt in &m.points {
+                                    if pt.dist <= prediction {
+                                        out.points.push(collider_pos * pt.local_p2);
+                                    }
+                                }
+                                out.manifolds.push(CharacterPushManifold {
+                                    body: parent.handle,
+                                    normal,
+                                    velocity_to_transfer,
+                                    points_end: out.points.len() as u32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [fork 0024] Serial second half: applies a push gathered by
+    /// [`Self::prepare_character_collision_impulses`] with exactly the stock arithmetic and access order.
+    pub fn apply_character_collision_impulses(
+        &self,
+        bodies: &mut crate::dynamics::RigidBodySet,
+        character_mass: Real,
+        push: &CharacterPush,
+    ) {
+        let mut start = 0usize;
+        for m in &push.manifolds {
+            // Stock takes `&mut bodies[h]` once per manifold, even one without points within the prediction
+            // distance: keep that access (it records the body in the modified set, which affects the next step).
+            let body = &mut bodies[m.body];
+            let end = m.points_end as usize;
+            for contact_point in &push.points[start..end] {
+                let body_mass = body.mass();
+                let contact_point = *contact_point;
+                let delta_vel_per_contact = (m.velocity_to_transfer
+                    - body.velocity_at_point(contact_point))
+                .dot(m.normal);
+                let mass_ratio = body_mass * character_mass / (body_mass + character_mass);
+
+                body.apply_impulse_at_point(
+                    m.normal * delta_vel_per_contact.max(0.0) * mass_ratio,
+                    contact_point,
+                    true,
+                );
+            }
+            start = end;
+        }
+    }
+}
+
+/// [fork 0024] One contact manifold of a gathered character push (see
+/// [`KinematicCharacterController::prepare_character_collision_impulses`]).
+#[derive(Copy, Clone, Debug)]
+pub struct CharacterPushManifold {
+    /// The dynamic body pushed.
+    pub body: crate::dynamics::RigidBodyHandle,
+    /// World-space manifold normal (character towards obstacle), as the stock push uses it.
+    pub normal: Vector,
+    /// The character velocity to transfer along `normal` for the collision this manifold came from.
+    pub velocity_to_transfer: Vector,
+    /// End (exclusive) of this manifold's contact points in [`CharacterPush::points`].
+    pub points_end: u32,
+}
+
+/// [fork 0024] The gathered push of one character: manifolds in the stock visit order and their contact points
+/// (world space, only those within the prediction distance).
+#[derive(Clone, Debug, Default)]
+pub struct CharacterPush {
+    /// Manifolds in the order the stock push visits them.
+    pub manifolds: Vec<CharacterPushManifold>,
+    /// World-space contact points, grouped by manifold.
+    pub points: Vec<Vector>,
 }
 
 fn subtract_hit(translation: Vector, hit: &ShapeCastHit) -> Vector {
