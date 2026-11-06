@@ -42,6 +42,8 @@ impl BroadPhaseBvh {
         events: &mut Vec<BroadPhasePairEvent>,
     ) {
         self.frame_index = self.frame_index.overflowing_add(1).0;
+        // [fork 0022] the poses are about to change: a canonical query BVH would go stale.
+        self.canonical_query_tree = None;
 
         // If the previous update requested a deferred optimization but nothing ran it
         // (e.g. the broad-phase is driven without the physics pipeline), run it now.

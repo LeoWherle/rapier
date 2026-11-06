@@ -100,6 +100,11 @@ pub struct BroadPhaseBvh {
     /// solver; consumed by [`Self::take_deferred_optimize`].
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     deferred_optimize_pending: bool,
+    /// [fork 0022] Query-only BVH built by [`Self::refresh_canonical_query_bvh`] from the
+    /// colliders' current AABBs (ascending collider index); scene queries use it instead of the
+    /// broad-phase tree until the next [`Self::update`] drops it.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) canonical_query_tree: Option<Bvh>,
 }
 
 // TODO: would be interesting to try out:
@@ -180,6 +185,30 @@ impl BroadPhaseBvh {
     /// Initializes a new empty broad-phase.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// [fork 0022] Builds a query-only BVH from the colliders' *current* AABBs (enabled
+    /// colliders, ascending index, binned build) and makes scene queries
+    /// ([`Self::as_query_pipeline`]) use it until the next [`Self::update`].
+    ///
+    /// The broad-phase tree's leaves are fat AABBs refreshed only inside a step, and its layout
+    /// depends on the history of updates, re-insertions and optimizations. Queries issued between
+    /// steps (e.g. character controllers) on a world whose bodies were just written by a snapshot
+    /// restore or a rebuild can then miss or reorder candidates; with this BVH the candidate set
+    /// and traversal order are a function of the current collider poses only.
+    pub fn refresh_canonical_query_bvh(&mut self, colliders: &crate::geometry::ColliderSet) {
+        self.canonical_query_tree = Some(Bvh::from_iter(
+            parry::partitioning::BvhBuildStrategy::Binned,
+            colliders
+                .iter()
+                .filter(|(_, c)| c.is_enabled())
+                .map(|(h, c)| (h.into_raw_parts().0 as usize, c.compute_aabb())),
+        ));
+    }
+
+    /// [fork 0022] Drops the BVH built by [`Self::refresh_canonical_query_bvh`].
+    pub fn clear_canonical_query_bvh(&mut self) {
+        self.canonical_query_tree = None;
     }
 
     /// The change-detection margin (fat-AABB skin) for a leaf with the given AABB:
