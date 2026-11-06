@@ -1409,6 +1409,19 @@ impl RigidBodyActivation {
         }
     }
 
+    /// [fork 0014] The pose the sleep test compares the next step's pose with (the body's pose
+    /// at its previous dynamic step). Part of an exact handoff payload for sleep-enabled bodies.
+    #[inline]
+    pub fn sleep_prev_pose(&self) -> &Pose {
+        &self.sleep_prev_pose
+    }
+
+    /// [fork 0014] Sets the pose the next sleep test compares with (handoff import).
+    #[inline]
+    pub fn set_sleep_prev_pose(&mut self, pose: Pose) {
+        self.sleep_prev_pose = pose;
+    }
+
     /// Returns `true` if the body is not asleep.
     #[inline]
     pub fn is_active(&self) -> bool {

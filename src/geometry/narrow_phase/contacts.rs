@@ -51,6 +51,9 @@ impl NarrowPhase {
             n if self.fork_step_index % n as u64 == 0 => 1,
             _ => 2,
         };
+        // [fork 0014] bit 2: recycle only pairs that hold contact points.
+        let recycle_phase =
+            recycle_phase | ((self.history_free.recycle_touching_only as u8) << 2);
         self.fork_step_index += 1;
         let awake_body_mask = core::mem::take(&mut self.awake_body_mask);
         let soft_ctx = soft_bodies.map(|(soft_bodies, params)| SoftDetectionCtx {

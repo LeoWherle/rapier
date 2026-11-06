@@ -437,6 +437,13 @@ pub struct HistoryFreeHandoff {
     /// the poses since the last epoch, so a handoff that lands on an epoch step carries no
     /// recycle history. Requires `IntegrationParameters::contact_recycling`.
     pub recycle_epoch: u32,
+    /// [fork 0014] Recycle only pairs whose manifolds hold at least one contact point. A
+    /// point-less pair then keeps no recycle reference pose and is fully updated every step,
+    /// exactly like a freshly created one, so whether (and since when) the broad phase kept a
+    /// non-touching pair alive no longer changes results. Pairs with points keep stock
+    /// recycling; their `recycle_state` is part of a handoff payload
+    /// (`RigidPairContacts::recycle_state`). Requires `IntegrationParameters::contact_recycling`.
+    pub recycle_touching_only: bool,
 }
 
 pub(crate) type ContactManifoldIndex = usize;

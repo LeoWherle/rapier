@@ -294,6 +294,18 @@ pub struct RigidPairContacts {
 }
 
 impl RigidPairContacts {
+    /// [fork 0014] The pair's contact-recycle reference state (pose at its last full narrow-phase
+    /// update), if any. Part of an exact handoff payload when contact recycling is on.
+    pub fn recycle_state(&self) -> Option<&ContactRecycleState> {
+        self.recycle_state.as_ref()
+    }
+    /// [fork 0014] Sets the contact-recycle reference state (handoff import).
+    pub fn set_recycle_state(&mut self, state: Option<ContactRecycleState>) {
+        self.recycle_state = state;
+    }
+}
+
+impl RigidPairContacts {
     fn new() -> Self {
         Self {
             manifolds: Vec::new(),
@@ -348,7 +360,7 @@ impl RigidPairContacts {
 /// update, used by contact recycling to bound how much the pair moved since.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
-pub(crate) struct ContactRecycleState {
+pub struct ContactRecycleState {
     /// Pose of the second collider relative to the first at the last full update.
     pub pos12: Pose,
     /// World rotation of the first collider at the last full update. The frozen world-space anchors
@@ -815,6 +827,28 @@ pub struct SolverContactGeneric<N: ScalarType, const LANES: usize> {
     pub contact_id: [ContactId; LANES], // 1/1
     #[cfg(feature = "dim3")]
     pub(crate) padding: [N; 1],
+}
+
+impl SolverContact {
+    /// [fork 0014] Builds a solver contact from its public fields (handoff import of a recycled
+    /// pair, whose solver contacts are kept verbatim until its next full narrow-phase update).
+    pub fn from_parts(
+        anchor1: Vector,
+        anchor2: Vector,
+        dist: Real,
+        tangent_velocity: Vector,
+        contact_id: ContactId,
+    ) -> Self {
+        Self {
+            anchor1,
+            anchor2,
+            dist,
+            tangent_velocity,
+            contact_id: [contact_id],
+            #[cfg(feature = "dim3")]
+            padding: [0.0; 1],
+        }
+    }
 }
 
 /// The storage type of [`SolverContactGeneric::contact_id`]: one `Real`-sized slot

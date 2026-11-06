@@ -13,7 +13,7 @@ pub use self::collider_handle::ColliderHandle;
 #[cfg(feature = "alloc")]
 pub use self::collider_set::{ColliderSet, ModifiedColliders};
 #[cfg(feature = "alloc")]
-pub(crate) use self::contact_pair::ContactRecycleState;
+pub use self::contact_pair::ContactRecycleState;
 #[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::PairEventStatus;
 #[cfg(feature = "alloc")]
