@@ -203,6 +203,27 @@ pub struct KinematicCharacterController {
     /// This value should remain fairly small since it can introduce artificial "bumps" when sliding
     /// along a flat surface.
     pub normal_nudge_factor: Real,
+    /// [fork 0012] Opt-in cost cuts that change trajectories slightly (all `false` = stock 0.36.1).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub fast_paths: CharacterFastPaths,
+}
+
+/// [fork 0012] Opt-in KCC cost cuts. Each one can change character trajectories (see the fork notes);
+/// all `false` (the default) reproduces stock 0.36.1 exactly.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CharacterFastPaths {
+    /// When the character is grounded at its start pose, drop the downward (−`up`) part of the
+    /// desired translation before the slide loop: no slide-loop cast just to touch the ground
+    /// (snap-to-ground still follows descending ground). A character walking off a ledge starts
+    /// to fall one tick later.
+    pub grounded_skip_downward: bool,
+    /// Snap to the ground only if the character is not already grounded at the end of the slide
+    /// loop (the stock comment's intent; stock snaps whenever it was grounded at the start).
+    pub snap_only_if_not_grounded: bool,
+    /// Skip the autostep casts when the obstacle's highest point (exact support point along `up`)
+    /// is above `feet + max_height`: such a step cannot succeed in the usual geometry.
+    pub autostep_height_precheck: bool,
 }
 
 impl Default for KinematicCharacterController {
@@ -216,6 +237,7 @@ impl Default for KinematicCharacterController {
             min_slope_slide_angle: Real::frac_pi_4(),
             snap_to_ground: Some(CharacterLength::Relative(0.2)),
             normal_nudge_factor: 1.0e-4,
+            fast_paths: CharacterFastPaths::default(),
         }
     }
 }
@@ -334,6 +356,13 @@ impl KinematicCharacterController {
             None,
             None,
         );
+        // [fork 0012] Opt-in: a grounded character does not cast into the ground it stands on.
+        if self.fast_paths.grounded_skip_downward && grounded_at_starting_pos {
+            let down = translation_remaining.dot(self.up);
+            if down < 0.0 {
+                translation_remaining -= self.up * down;
+            }
+        }
 
         let mut max_iters = 20;
         let mut kinematic_friction_translation = Vector::ZERO;
@@ -462,7 +491,10 @@ impl KinematicCharacterController {
             );
         }
         // If needed, and if we are not already grounded, snap to the ground.
-        if grounded_at_starting_pos {
+        // [fork 0012] Opt-in: really skip the snap cast when already grounded.
+        if grounded_at_starting_pos
+            && !(self.fast_paths.snap_only_if_not_grounded && result.grounded)
+        {
             self.snap_to_ground(
                 queries,
                 character_shape,
@@ -812,6 +844,24 @@ impl KinematicCharacterController {
             }
 
             queries.filter.flags |= QueryFilterFlags::EXCLUDE_DYNAMIC;
+        }
+
+        // [fork 0012] Opt-in: an obstacle whose top is higher than a step cannot be stepped on.
+        if self.fast_paths.autostep_height_precheck {
+            if let Some(co) = queries.colliders.get(stair_handle) {
+                if let (Some(obstacle), Some(character)) =
+                    (co.shape().as_support_map(), character_shape.as_support_map())
+                {
+                    let local_up = co.position().rotation.inverse() * self.up;
+                    let top = (co.position() * obstacle.local_support_point(local_up)).dot(self.up);
+                    let char_down = character_pos.rotation.inverse() * -self.up;
+                    let feet =
+                        (character_pos * character.local_support_point(char_down)).dot(self.up);
+                    if top - feet > max_height {
+                        return false;
+                    }
+                }
+            }
         }
 
         let shifted_character_pos = Pose::from_parts(

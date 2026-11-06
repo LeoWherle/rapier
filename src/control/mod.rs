@@ -2,8 +2,8 @@
 
 #[cfg(feature = "alloc")]
 pub use self::character_controller::{
-    CharacterAutostep, CharacterCollision, CharacterLength, EffectiveCharacterMovement,
-    KinematicCharacterController,
+    CharacterAutostep, CharacterCollision, CharacterFastPaths, CharacterLength,
+    EffectiveCharacterMovement, KinematicCharacterController,
 };
 #[cfg(feature = "alloc")]
 pub use self::pid_controller::{PdController, PdErrors, PidController};
