@@ -58,7 +58,7 @@ std = [
 # per substep, solving `(M + h D + h^2 K) dv = b` over the whole body. Off by
 # default: it adds per-body solver state and is still experimental.
 fem = []
-parallel = ["dep:rayon", "std", "parry2d/parallel"]
+parallel = ["dep:rayon", "dep:libc", "std", "parry2d/parallel"]
 # Drops the `Sync` requirement from callbacks (`PhysicsHooks`, `EventHandler`).
 # As a side effect, this also removes the dedicated threadpool API from the physics world
 # and pipeline.
@@ -133,3 +133,6 @@ bincode.workspace = true
 serde_json.workspace = true
 serde = { workspace = true, features = ["std"] }
 oorandom.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
