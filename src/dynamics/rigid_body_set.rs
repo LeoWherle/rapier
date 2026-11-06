@@ -147,6 +147,18 @@ impl RigidBodySet {
     /// );
     /// // Store `handle` to access this body later
     /// ```
+    /// [engine-mod-rapier patch] Like [`Self::insert`] but at a caller-chosen arena slot.
+    /// Returns `None` if the slot is occupied.
+    pub fn insert_at(&mut self, index: u32, rb: impl Into<RigidBody>) -> Option<RigidBodyHandle> {
+        let mut rb = rb.into();
+        rb.reset_internal_references();
+        rb.changes.set(RigidBodyChanges::all(), true);
+        let handle = RigidBodyHandle(self.bodies.insert_at(index, rb)?);
+        self.modified_bodies
+            .push_unchecked(handle, &mut self.bodies[handle.0]);
+        Some(handle)
+    }
+
     pub fn insert(&mut self, rb: impl Into<RigidBody>) -> RigidBodyHandle {
         let mut rb = rb.into();
         // Make sure the internal links are reset, they may not be
