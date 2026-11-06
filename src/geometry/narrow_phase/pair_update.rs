@@ -148,7 +148,10 @@ pub(super) fn process_pair(
                     // SAFETY: each pair is processed at most once per update (disjoint slots).
                     let mut requalified = false;
                     let hint = unsafe { &mut *hints_ptr.0.add(edge_id as usize) };
-                    if *hint & PAIR_HINT_COUNT_MASK == 0 {
+                    // KQ23 fix: also repair a hint whose DYN bit is stale (pair first processed while
+                    // both sides were asleep, e.g. bodies inserted with `sleeping(true)`, then woken by
+                    // the begin-touch transition without a count-clear).
+                    if *hint & PAIR_HINT_COUNT_MASK == 0 || *hint & PAIR_HINT_DYN_BIT == 0 {
                         let dyn_awake = |co: &crate::geometry::Collider| {
                             co.parent.is_some_and(|p| {
                                 let rb = &bodies[p.handle];
