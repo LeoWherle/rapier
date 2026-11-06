@@ -75,6 +75,8 @@ pub(super) fn process_pair(
     contact_clustering: bool,
     // Contact-recycling drift threshold; `0.0` disables recycling.
     contact_recycle_distance: Real,
+    // [fork 0007] recycle-epoch phase (see `NarrowPhase::compute_contacts`).
+    recycle_phase: u8,
     bodies: &RigidBodySet,
     colliders: &ColliderSet,
     impulse_joints: &ImpulseJointSet,
@@ -112,7 +114,7 @@ pub(super) fn process_pair(
     // Contact recycling: if the relative pose barely moved since the
     // last full update, skip contact determination entirely. Must run before the
     // `has_any_active_contact` walk below (whose result recycling cannot change).
-    if contact_recycle_distance > 0.0 {
+    if contact_recycle_distance > 0.0 && recycle_phase != 1 {
         if let Some(state) = pair.rigid().and_then(|r| r.recycle_state.as_ref()) {
             // Anything beyond a position change (shape, groups, type,
             // enabled flag, ...) requires a full update, as do pairs
@@ -706,7 +708,8 @@ pub(super) fn process_pair(
 
         // Remember the relative configuration this full update ran at, so
         // subsequent steps can recycle the pair while it stays close to it.
-        if contact_recycle_distance > 0.0 {
+        // [fork 0007] inside a recycle epoch, keep the epoch's reference pose.
+        if contact_recycle_distance > 0.0 && (recycle_phase != 2 || rigid.recycle_state.is_none()) {
             // Computing the local AABBs goes through a dyn Shape call per
             // collider per full update; the extents only change when a
             // shape does, so reuse the previous full update's value.

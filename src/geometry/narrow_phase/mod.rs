@@ -408,6 +408,35 @@ pub struct NarrowPhase {
     /// step) skip the buffer reallocation of freshly constructed pairs.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     retired_pairs: Vec<ContactPair>,
+    /// [fork 0007] Opt-in history-free solver state for exact handoff (default: off = stock).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub history_free: HistoryFreeHandoff,
+    /// [fork 0007] Number of `compute_contacts` calls so far (the recycle-epoch clock).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    fork_step_index: u64,
+    /// [fork 0007] The canonical colouring is up to date (no transition, re-parenting, type
+    /// change, pair removal or import since the last canonical pass).
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    fork_canon_clean: bool,
+}
+
+/// [fork 0007] Opt-in rules that make the narrow phase's solver-facing state a function of the
+/// current world state (plus a bounded, globally scheduled window), instead of the whole
+/// history, so a world that received bodies by handoff evolves like one that always held them.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryFreeHandoff {
+    /// Re-derive every touching pair's solver colour (= its Gauss-Seidel rank) from scratch in
+    /// canonical `(min body index, max body index, edge)` order whenever the touching set or a
+    /// body's type changed. Stock colouring is incremental: a pair keeps the colour it got when
+    /// it began touching, so colours (and results) depend on the order of past events.
+    pub canonical_coloring: bool,
+    /// `0` = stock contact recycling. `N > 0`: every pair gets a full narrow-phase update on
+    /// steps whose index is a multiple of `N` (an *epoch*), and a pair's recycle reference pose
+    /// is re-anchored only there (or when it has none). Recycling decisions then depend only on
+    /// the poses since the last epoch, so a handoff that lands on an epoch step carries no
+    /// recycle history. Requires `IntegrationParameters::contact_recycling`.
+    pub recycle_epoch: u32,
 }
 
 pub(crate) type ContactManifoldIndex = usize;
@@ -451,6 +480,9 @@ impl NarrowPhase {
             force_list_valid: false,
             solver_color_todo: Vec::new(),
             soft_self: Default::default(),
+            history_free: HistoryFreeHandoff::default(),
+            fork_step_index: 0,
+            fork_canon_clean: false,
         }
     }
 

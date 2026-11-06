@@ -286,6 +286,7 @@ impl NarrowPhase {
                     if co.changes.intersects(
                         ColliderChanges::PARENT | ColliderChanges::PARENT_EFFECTIVE_DOMINANCE,
                     ) {
+                        self.fork_canon_clean = false; // [fork 0007]
                         let mut edges_to_recolor = alloc::vec::Vec::new();
                         for edge in self.contact_graph.graph.edges(gid.contact_graph_index) {
                             edges_to_recolor.push(edge.id().index());
@@ -562,6 +563,7 @@ impl NarrowPhase {
                     // Also wake up the dynamic bodies that were in contact.
                     if let Some(mut ctct) = contact_pair {
                         clear_pair_solver_color(&mut self.body_solver_color_masks, &mut ctct);
+                        self.fork_canon_clean = false; // [fork 0007]
 
                         if ctct.has_any_active_contact() {
                             if let Some(islands) = islands {
@@ -653,6 +655,7 @@ impl NarrowPhase {
             }
         };
         self.solver_graph_valid = false;
+        self.fork_canon_clean = false; // [fork 0007]
         let pair = &mut self.contact_graph.graph.edges[edge_id].weight;
         if pair.has_any_active_contact() {
             let parent = |co: ColliderHandle| colliders.get(co).and_then(|c| c.parent.map(|p| p.handle));
@@ -709,6 +712,7 @@ impl NarrowPhase {
         let (i1, i2) = (gid1.contact_graph_index, gid2.contact_graph_index);
         let eid = self.contact_graph.add_edge(i1, i2, pair);
         self.solver_graph_valid = false;
+        self.fork_canon_clean = false; // [fork 0007]
         Some(eid.index())
     }
 

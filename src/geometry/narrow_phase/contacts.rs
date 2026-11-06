@@ -44,6 +44,14 @@ impl NarrowPhase {
         soft_bodies: Option<(&SoftBodySet, &IntegrationParameters)>,
     ) {
         self.update_awake_body_mask(islands);
+        // [fork 0007] recycle epochs: 0 = stock, 1 = epoch step (full update + re-anchor every
+        // pair), 2 = inside an epoch (recycle as usual, anchor only pairs without a state).
+        let recycle_phase: u8 = match self.history_free.recycle_epoch {
+            0 => 0,
+            n if self.fork_step_index % n as u64 == 0 => 1,
+            _ => 2,
+        };
+        self.fork_step_index += 1;
         let awake_body_mask = core::mem::take(&mut self.awake_body_mask);
         let soft_ctx = soft_bodies.map(|(soft_bodies, params)| SoftDetectionCtx {
             soft_bodies,
@@ -107,6 +115,7 @@ impl NarrowPhase {
                 dt,
                 contact_clustering,
                 contact_recycle_distance,
+                recycle_phase,
                 bodies,
                 colliders,
                 impulse_joints,
@@ -134,6 +143,7 @@ impl NarrowPhase {
                 dt,
                 contact_clustering,
                 contact_recycle_distance,
+                recycle_phase,
                 bodies,
                 colliders,
                 impulse_joints,
@@ -391,6 +401,54 @@ impl NarrowPhase {
             }
         }
         self.apply_deferred_solver_coloring(&mut color_todo);
+        // [fork 0007] canonical colouring: re-derive every touching pair's colour from scratch,
+        // in canonical (min, max body index, edge) order, whenever anything that colouring
+        // depends on changed. The result is a function of the current touching set only.
+        if self.history_free.canonical_coloring && (!transitions.is_empty() || !self.fork_canon_clean)
+        {
+            use crate::geometry::contact_pair::SOLVER_COLOR_UNCOLORED;
+            let old_colors: Vec<u8> = self
+                .contact_graph
+                .graph
+                .edges
+                .iter()
+                .map(|e| e.weight.rigid().map_or(SOLVER_COLOR_UNCOLORED, |r| r.solver_color))
+                .collect();
+            for m in self.body_solver_color_masks.iter_mut() {
+                *m = 0;
+            }
+            color_todo.clear();
+            for edge_id in 0..self.contact_graph.graph.edges.len() {
+                let pair = &mut self.contact_graph.graph.edges[edge_id].weight;
+                if let Some(r) = pair.rigid_mut() {
+                    r.solver_color = SOLVER_COLOR_UNCOLORED;
+                    r.solver_color_bodies = [u32::MAX; 2];
+                }
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let body_info = |co: ColliderHandle| {
+                    colliders.get(co).and_then(|co| co.parent.as_ref()).map(|p| {
+                        let rb = &bodies[p.handle];
+                        (p.handle.into_raw_parts().0, rb.is_fixed())
+                    })
+                };
+                let (i1, i2) = (body_info(pair.collider1), body_info(pair.collider2));
+                color_todo.push((edge_id as u32, pack_color_body_info(i1), pack_color_body_info(i2)));
+            }
+            self.apply_deferred_solver_coloring(&mut color_todo);
+            let changed = self
+                .contact_graph
+                .graph
+                .edges
+                .iter()
+                .zip(old_colors.iter())
+                .any(|(e, &c)| e.weight.rigid().map_or(SOLVER_COLOR_UNCOLORED, |r| r.solver_color) != c);
+            if changed {
+                self.solver_graph_valid = false;
+            }
+        }
+        self.fork_canon_clean = true;
         self.solver_color_todo = color_todo;
     }
 
