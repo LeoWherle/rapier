@@ -251,27 +251,26 @@ impl NarrowPhase {
             const BLOCK: usize = 64;
             #[allow(unused_mut)]
             let (mut dirty, mut force_full_rebuild) = if update_candidates.len() > BLOCK {
-                let cursor = core::sync::atomic::AtomicUsize::new(0);
-                let candidates = &update_candidates[..];
-                let per_thread = rayon::broadcast(|_| {
-                    let mut stats = (Vec::new(), false);
-                    loop {
-                        let start = cursor.fetch_add(BLOCK, core::sync::atomic::Ordering::Relaxed);
-                        if start >= candidates.len() {
-                            break;
-                        }
-                        let end = (start + BLOCK).min(candidates.len());
-                        process_block(&mut stats, &candidates[start..end], worker_hooks);
-                    }
-                    stats
-                });
-                per_thread
-                    .into_iter()
-                    .fold((Vec::new(), false), |mut a, mut b| {
-                        a.0.append(&mut b.0);
-                        a.1 |= b.1;
-                        a
-                    })
+                // Chunked fold/reduce instead of `rayon::broadcast`: a broadcast job must run on
+                // EVERY pool thread (it cannot be stolen), so one descheduled worker delays it.
+                use rayon::prelude::*;
+                update_candidates
+                    .par_chunks(BLOCK)
+                    .fold(
+                        || (Vec::new(), false),
+                        |mut s, c| {
+                            process_block(&mut s, c, worker_hooks);
+                            s
+                        },
+                    )
+                    .reduce(
+                        || (Vec::new(), false),
+                        |mut a, mut b| {
+                            a.0.append(&mut b.0);
+                            a.1 |= b.1;
+                            a
+                        },
+                    )
             } else {
                 let mut stats = (Vec::new(), false);
                 process_block(&mut stats, &update_candidates, worker_hooks);
