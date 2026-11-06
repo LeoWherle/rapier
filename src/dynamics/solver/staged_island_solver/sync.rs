@@ -24,6 +24,9 @@ type AtomicCursor = core::sync::atomic::AtomicU32;
 const STAGE_SHIFT: u32 = CursorInt::BITS / 2;
 /// Mask of a packed cursor's position half.
 const POS_MASK: CursorInt = (1 << STAGE_SHIFT) - 1;
+/// Spins before a stage waiter parks on the futex (measured: spikes/rapier-oversub).
+#[cfg(all(feature = "parallel", target_os = "linux"))]
+const SPIN_BEFORE_PARK: u32 = 256;
 
 /// An atomic cursor on its own cache line (no false sharing between per-worker claim cursors).
 /// Packed `(stage_ordinal << STAGE_SHIFT) | position` so a straggler's stale claim fails its CAS
@@ -48,6 +51,11 @@ pub(super) struct StageSync {
     /// when this reaches the stage's total (every unit claimed *and* executed).
     completed: AtomicUsize,
     cursors: Vec<PaddedCursor>,
+    /// Futex word mirroring the low 32 bits of `published`, and the number of parked waiters.
+    #[cfg(all(feature = "parallel", target_os = "linux"))]
+    seq: core::sync::atomic::AtomicU32,
+    #[cfg(all(feature = "parallel", target_os = "linux"))]
+    sleepers: AtomicUsize,
 }
 
 impl StageSync {
@@ -57,6 +65,10 @@ impl StageSync {
             published: AtomicUsize::new(0),
             advance_ticket: AtomicUsize::new(0),
             completed: AtomicUsize::new(0),
+            #[cfg(all(feature = "parallel", target_os = "linux"))]
+            seq: core::sync::atomic::AtomicU32::new(0),
+            #[cfg(all(feature = "parallel", target_os = "linux"))]
+            sleepers: AtomicUsize::new(0),
             cursors: (0..num_workers)
                 .map(|_| PaddedCursor(AtomicCursor::new(0)))
                 .collect(),
@@ -94,6 +106,15 @@ impl StageSync {
         }
         self.completed.store(0, Ordering::Relaxed);
         self.published.store(next, Ordering::Release);
+        // Wake parked waiters (only pays a syscall when someone is parked). SeqCst store/load pairs
+        // with the waiter's SeqCst `sleepers` increment + re-check, so a wake cannot be missed.
+        #[cfg(all(feature = "parallel", target_os = "linux"))]
+        {
+            self.seq.store(next as u32, Ordering::SeqCst);
+            if self.sleepers.load(Ordering::SeqCst) > 0 {
+                unsafe { libc::syscall(libc::SYS_futex, &self.seq as *const _, 129 /* FUTEX_WAKE_PRIVATE */, i32::MAX) };
+            }
+        }
     }
 
     /// Ends the caller's stage `stage` (total `stage_work`); returns the next stage ordinal.
@@ -117,6 +138,20 @@ impl StageSync {
         while self.published.load(Ordering::Acquire) == stage {
             core::hint::spin_loop();
             spins += 1;
+            // Spin briefly, then park: a waiter that keeps spinning on an oversubscribed or
+            // co-located host burns the CPU time the thread it waits for needs.
+            #[cfg(all(feature = "parallel", target_os = "linux"))]
+            if spins > SPIN_BEFORE_PARK {
+                self.sleepers.fetch_add(1, Ordering::SeqCst);
+                if self.seq.load(Ordering::SeqCst) == stage as u32
+                    && self.published.load(Ordering::SeqCst) == stage
+                {
+                    unsafe { libc::syscall(libc::SYS_futex, &self.seq as *const _, 128 /* FUTEX_WAIT_PRIVATE */, stage as u32, core::ptr::null::<libc::timespec>()) };
+                }
+                self.sleepers.fetch_sub(1, Ordering::SeqCst);
+                spins = 0;
+            }
+            #[cfg(not(all(feature = "parallel", target_os = "linux")))]
             if spins > 10_000 {
                 // Only reachable with >1 worker (a single worker never waits on
                 // another), so `std` is always available here in practice; the
